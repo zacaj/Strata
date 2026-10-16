@@ -343,6 +343,29 @@ class ToolMarkupHold:
         return "".join(self.sent)
 
 
+def _positive_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def engine_params(keys: str) -> dict:
+    """What the engine runs a request with, from the sampling keys it was sent (StrataEngine.sampling_keys), with
+    the engine's own defaults for every key left out (serve: GEN's parser in src/program/generate.cpp): greedy when
+    there is no temperature, top_k 20, no penalties, and no seed (the engine then takes one from its clock)."""
+    got = {}
+    for tok in keys.split():
+        k, _, v = tok.partition("=")
+        if k in ("temperature", "top_p", "min_p", "penalty_repeat", "penalty_freq", "penalty_present"):
+            got[k] = float(v)
+        elif k in ("top_k", "penalty_last_n", "seed", "pin"):
+            got[k] = int(v)
+    greedy = got.get("temperature", 0.0) <= 0.0
+    return {"greedy": greedy, "temperature": 0.0 if greedy else got["temperature"],
+            "top_p": got.get("top_p", 1.0), "top_k": got.get("top_k", 20), "min_p": got.get("min_p", 0.0),
+            "penalty_repeat": got.get("penalty_repeat", 1.0), "penalty_freq": got.get("penalty_freq", 0.0),
+            "penalty_present": got.get("penalty_present", 0.0), "penalty_last_n": got.get("penalty_last_n", 0),
+            "seed": got.get("seed"), "keys": keys.strip()}
+
+
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
     """#471: the prompt tokens a request got through - all of them, unless the engine's DONE line says a cancel stopped
     its prompt read part-way (then the reused ones plus those read).  /metrics' history and totals count these, so a

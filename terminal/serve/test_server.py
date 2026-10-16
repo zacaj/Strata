@@ -4230,9 +4230,13 @@ class UsageAndStatus(unittest.TestCase):
         self.assertEqual(t["predicted_n"], u["completion_tokens"])
         self.assertAlmostEqual(t["prompt_per_second"], t["prompt_n"] / 0.040, delta=0.1)
         self.assertAlmostEqual(t["predicted_per_second"], 50.0, delta=0.1)            # 20 ms a token
+        e = b["strata_effective"]                                                     # what took effect, not asked
+        self.assertEqual(e["max_tokens"], 20)
+        self.assertIn("sampling", e)
 
     def test_openai_stream(self):
         last = self.chat("/v1/chat/completions", stream=True)[-1]
+        self.assertEqual(last["strata_effective"]["max_tokens"], 20)
         self.assertEqual(last["usage"]["prompt_tokens_details"]["cached_tokens"], ClockedEngine.REUSED)
         self.assertEqual(last["timings"]["cache_n"], ClockedEngine.REUSED)
 
@@ -4256,6 +4260,23 @@ class UsageAndStatus(unittest.TestCase):
         self.assertEqual(u["input_tokens"] + u["cache_creation_input_tokens"] + u["cache_read_input_tokens"],
                          len(self.engine.last_prompt))
         self.assertGreater(u["output_tokens"], 0)
+        self.assertEqual(self.chat("/v1/messages")["strata_effective"]["max_tokens"], 20)
+
+    def test_responses_effective(self):
+        status, raw = self.request("/v1/responses", {"model": "x", "max_output_tokens": 20, "input": "hi"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["strata_effective"]["max_tokens"], 20)
+
+    def test_engine_params_fill_the_engines_defaults(self):
+        from serve.server import StrataEngine, engine_params
+        p = engine_params(StrataEngine.sampling_keys({"temperature": 0.7, "top_k": 0, "seed": 5,
+                                                      "repetition_penalty": 1.1}))
+        self.assertFalse(p["greedy"])
+        self.assertEqual((p["temperature"], p["top_k"], p["seed"], p["penalty_last_n"], p["penalty_repeat"]),
+                         (0.7, 64, 5, 64, 1.1))          # top_k 0 is sent as 64; a penalty brings its 64 window
+        g = engine_params(StrataEngine.sampling_keys({"temperature": 0, "top_p": 0.5}))
+        self.assertTrue(g["greedy"])
+        self.assertEqual((g["temperature"], g["top_p"], g["top_k"], g["seed"]), (0.0, 0.5, 20, None))
 
     def test_v1_status(self):
         self.chat("/v1/chat/completions")

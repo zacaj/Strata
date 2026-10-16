@@ -43,6 +43,7 @@ import math
 import os
 import platform
 import queue
+import secrets
 import re
 import select
 import signal
@@ -122,6 +123,7 @@ from serve.server_parts.base import (  # noqa: F401  (moved unchanged, file spli
     write_temporary,
 )
 from serve.server_parts.core import (  # noqa: F401  (moved unchanged, file split)
+    _positive_int, engine_params,
     Detokenizer,
     NO_LINE,
     OPENAI_MAX_STOP,
@@ -5573,6 +5575,7 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        merged_sampling = dict(sampling or {})          # what the request resolved to, before any override below
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
@@ -5598,6 +5601,8 @@ class Service:
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
+        has_wire = callable(getattr(self.engine, "sampling_keys", None))
+        server_seed = False                             # the seed in `sampling` is one this server picked
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
 
@@ -5770,6 +5775,12 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
+                        if has_wire and float((sampling or {}).get("temperature") or 0) > 0 and \
+                                (server_seed or not _positive_int((sampling or {}).get("seed"))):
+                            # the engine would seed a sampled pass from its clock and not say which: pick the seed
+                            # here (a fresh one each pass, as the clock gave) so the response can report it
+                            server_seed = True
+                            sampling = {**(sampling or {}), "seed": secrets.randbits(62) + 1}
                         held = hold_end is not None and budget is not None
                         if held:   # the reasoning tokens left before the budget (at least one: a cut not yet clean)
                             pass_sampling = {k: v for k, v in (sampling or {}).items() if k != HOLD_KEY}   # (a copy: the hold is this pass's own)
@@ -6214,7 +6225,18 @@ class Service:
                 yield "event", ev
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                 "timings": timings, "reasoning_tokens": thinking_n,
-                "reasoning_recoveries": recovery_count}
+                "reasoning_recoveries": recovery_count,
+                # what took effect, for a caller that records it: the sampling after the merge with the defaults and
+                # after any recovery override, the output cap, and the thinking budget actually armed
+                "effective": {"sampling": {k: v for k, v in (sampling or {}).items() if k != "strata_img_keys"},
+                              "max_tokens": max_new, "thinking": bool(thinking), "reasoning_budget": budget}}
+        if has_wire:                  # and what the engine got from it, defaults for the missing keys included
+            wire = engine_params(self.engine.sampling_keys(sampling or {}))
+            wire["seed_from"] = "server" if server_seed else "request" if wire["seed"] else "engine clock"
+            done["effective"]["engine"] = wire
+        if recovery_count:
+            done["effective"]["sampling_before_recovery"] = {
+                k: v for k, v in merged_sampling.items() if k != "strata_img_keys"}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
             if finish == "length":
@@ -6477,6 +6499,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                 last["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796: only when a call was refused as undeclared
             if x.get("unread_tool_markup"):
                 last["strata_unread_tool_markup"] = x["unread_tool_markup"]
+            if x.get("effective"):
+                last["strata_effective"] = x["effective"]
             yield last
     if not answered_done and not cancel.is_set():
         # Every admitted request ends with a "done" event that carries its finish reason. A run that simply stopped (a 200 with one chunk and no
@@ -6610,6 +6634,8 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 delta_event["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796
             if x.get("unread_tool_markup"):
                 delta_event["strata_unread_tool_markup"] = x["unread_tool_markup"]
+            if x.get("effective"):
+                delta_event["strata_effective"] = x["effective"]
             yield "message_delta", delta_event
             yield "message_stop", {"type": "message_stop"}
 
@@ -6878,7 +6904,7 @@ def make_handler(svc: Service):
                     self.record["http_status"] = code
                     raw = json.dumps(obj, ensure_ascii=False, indent=2)
                     self.record.update(response=raw[:262144], response_truncated=len(raw) > 262144)
-                    for key in ("error", "usage", "timings"):
+                    for key in ("error", "usage", "timings", "strata_effective"):
                         if key in obj:
                             self.record[key] = obj[key]
             body = json.dumps(obj, ensure_ascii=False).encode()
@@ -7754,6 +7780,9 @@ def make_handler(svc: Service):
                             delta = item["choices"][0]["delta"]
                             content, reasoning = delta.get("content", ""), delta.get("reasoning_content", "")
                             usage, timings = item.get("usage"), item.get("timings")
+                            if item.get("strata_effective"):
+                                with svc.status_lock:
+                                    self.record["strata_effective"] = item["strata_effective"]
                         elif api == "responses":
                             kind = item["type"]
                             content = item["delta"] if kind == "response.output_text.delta" else ""

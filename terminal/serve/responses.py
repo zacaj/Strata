@@ -864,6 +864,8 @@ class Assembler:
             self.response["strata_rejected_tool_calls"] = done["rejected_tool_calls"]
         if done.get("unread_tool_markup"):
             self.response["strata_unread_tool_markup"] = done["unread_tool_markup"]
+        if done.get("effective"):
+            self.response["strata_effective"] = done["effective"]     # what took effect (see Service._run)
         if length:
             self.response["status"] = "incomplete"
             self.response["incomplete_details"] = {"reason": "max_output_tokens"}
