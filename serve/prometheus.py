@@ -158,3 +158,8 @@ def strata(m: dict, out: list, lab: str):
     metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", hw.get("cpu"))
     metric("ram_used_bytes", "gauge", "RAM in use (hardware.ram_used).", hw.get("ram_used"))
     metric("ram_total_bytes", "gauge", "RAM (hardware.ram_total).", hw.get("ram_total"))
+    # Strata's own process tree (the server and what it started), beside the system totals above
+    metric("strata_cpu", "gauge", "Strata's CPU, percent of all logical CPUs (hardware.strata_cpu).", hw.get("strata_cpu"))
+    metric("strata_ram_bytes", "gauge", "Strata's resident RAM (hardware.strata_ram).", hw.get("strata_ram"))
+    metric("strata_gpu_mem_bytes", "gauge", "Strata's GPU memory (hardware.strata_gpu_mem).", hw.get("strata_gpu_mem"))
+    metric("strata_gpu_util", "gauge", "Strata's GPU busy, percent (hardware.strata_gpu_util).", hw.get("strata_gpu_util"))

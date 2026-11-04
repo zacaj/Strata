@@ -700,6 +700,18 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | Request totals and what is running in Prometheus' text format, under llama-server's metric names | `GET /metrics/prometheus` |
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
 
+**Strata against the rest of the PC.** The Monitor's GPU load, VRAM, CPU and disk cards draw Strata's own share
+(the server and every process it started: the engine, the image encoder, MCP servers) as a solid band under the
+system's total; the band above it is everything else. The VRAM and RAM bars are split the same way: the experts (the
+engine's expert cache and expert arena), the rest of Strata (weights, KV cache, buffers), other programs and free.
+`GET /metrics` has them as `hardware.strata_cpu` (percent of all logical CPUs, as `hardware.cpu`), `strata_ram`,
+`strata_disk_read_mb`, `strata_gpu_mem` and `strata_gpu_util`; Prometheus as `strata:strata_cpu` and so on. Where they
+come from: psutil for the CPU, RAM and disk; NVML's per-process lists for the GPU, and on Windows, where NVML reports
+no per-process memory, the GPU performance counters Task Manager reads. None of these tell work from waiting: the
+pool's workers spin between layers and the GPU spins in a kernel while it waits for them, and both count as busy.
+On an SMT CPU the pool's one thread per physical core reads about cores / threads of the CPU (50% on 8 cores and
+16 threads) however much it computes.
+
 `GET /metrics` answers a Prometheus scrape (`Accept: text/plain` or `application/openmetrics-text`) in the text
 format with vLLM's names - `vllm:num_requests_running` / `_waiting`, `vllm:kv_cache_usage_perc`, the token and
 request counters, `vllm:prefix_cache_queries_total` / `_hits_total` (prompt tokens read / reused),

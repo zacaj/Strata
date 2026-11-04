@@ -103,6 +103,87 @@ class _Nvml:
         out["pcie_tx_mb"] = tx / 1024.0 if tx is not None else None
         return out
 
+    # -------------------------------------------------------------------- per process (Strata vs the rest)
+    class ProcInfo(ctypes.Structure):          # nvmlProcessInfo_t, the _v2 / _v3 functions' entry
+        _fields_ = [("pid", ctypes.c_uint), ("usedGpuMemory", ctypes.c_ulonglong),
+                    ("gpuInstanceId", ctypes.c_uint), ("computeInstanceId", ctypes.c_uint)]
+
+    class ProcInfoV1(ctypes.Structure):        # nvmlProcessInfo_v1_t, the unversioned function's entry
+        _fields_ = [("pid", ctypes.c_uint), ("usedGpuMemory", ctypes.c_ulonglong)]
+
+    class UtilSample(ctypes.Structure):        # nvmlProcessUtilizationSample_t
+        _fields_ = [("pid", ctypes.c_uint), ("timeStamp", ctypes.c_ulonglong), ("smUtil", ctypes.c_uint),
+                    ("memUtil", ctypes.c_uint), ("encUtil", ctypes.c_uint), ("decUtil", ctypes.c_uint)]
+
+    NOT_AVAILABLE = 0xFFFFFFFFFFFFFFFF          # NVML_VALUE_NOT_AVAILABLE: what WDDM (Windows) reports per process
+    _util_ts = 0
+
+    def _running(self, kind):
+        """[(pid, bytes or None)] of the compute or graphics processes, or None when NVML cannot list them."""
+        for suffix, st in (("_v3", self.ProcInfo), ("_v2", self.ProcInfo), ("", self.ProcInfoV1)):
+            fn = getattr(self.lib, f"nvmlDeviceGet{kind}RunningProcesses{suffix}", None)
+            if fn is None:
+                continue
+            try:
+                n = ctypes.c_uint(0)
+                r = fn(self.dev, ctypes.byref(n), None)
+                if r not in (0, 7):            # 7: NVML_ERROR_INSUFFICIENT_SIZE, n now holds the count
+                    continue
+                n = ctypes.c_uint(n.value + 8)  # room for processes that start between the two calls
+                buf = (st * n.value)()
+                if fn(self.dev, ctypes.byref(n), buf) != 0:
+                    continue
+                return [(int(e.pid), None if e.usedGpuMemory == self.NOT_AVAILABLE else int(e.usedGpuMemory))
+                        for e in buf[:n.value]]
+            except (AttributeError, OSError):
+                continue
+        return None
+
+    def proc_mem(self, pids):
+        """Bytes of this card's memory the processes `pids` hold, or None when the driver does not say (WDDM)."""
+        if not self.ok():
+            return None
+        rows = self._running("Compute")
+        if rows is None:
+            return None
+        mine = [b for p, b in rows if p in pids]
+        if any(b is None for b in mine):
+            return None
+        return sum(mine)
+
+    def proc_util(self, pids):
+        """Percent of the card's time the processes `pids` ran a kernel since the last call (NVML's per-process
+        samples; like the card's own load figure it counts a kernel that spins as busy).  None: not supported."""
+        if not self.ok():
+            return None
+        fn = getattr(self.lib, "nvmlDeviceGetProcessUtilization", None)
+        if fn is None:
+            return None
+        try:
+            n = ctypes.c_uint(0)
+            ts = ctypes.c_ulonglong(self._util_ts)
+            r = fn(self.dev, None, ctypes.byref(n), ts)
+            if r == 6:                          # NVML_ERROR_NOT_FOUND: no samples since then, nothing ran
+                return 0.0
+            if r not in (0, 7) or n.value == 0:
+                return None if r not in (0, 7) else 0.0
+            buf = (self.UtilSample * n.value)()
+            r = fn(self.dev, buf, ctypes.byref(n), ts)
+            if r == 6:
+                return 0.0
+            if r != 0:
+                return None
+        except (AttributeError, OSError):
+            return None
+        rows = buf[:n.value]
+        if rows:
+            self._util_ts = max(int(e.timeStamp) for e in rows)
+        per = collections.defaultdict(list)
+        for e in rows:
+            if int(e.pid) in pids:
+                per[int(e.pid)].append(int(e.smUtil))
+        return float(min(100.0, sum(sum(v) / len(v) for v in per.values())))
+
 
 # ------------------------------------------------------------------------------------------------ AMD (Linux sysfs)
 SYSFS = "/sys"
@@ -383,14 +464,165 @@ class _CpuRamFallback:
             return None, None
 
 
+# ------------------------------------------------------------------------------------------------ Strata vs the rest
+def pdh_instance_pid(name):
+    """`pid_1234_luid_0x00000000_0x0000C8D4_phys_0[_eng_3_engtype_Compute]` -> (1234, luid, engine or None)."""
+    parts = name.split("_")
+    try:
+        pid = int(parts[parts.index("pid") + 1])
+        i = parts.index("luid")
+        luid = "_".join(parts[i + 1:i + 3])
+        eng = parts[parts.index("eng") + 1] if "eng" in parts else None
+    except (ValueError, IndexError):
+        return None, None, None
+    return pid, luid, eng
+
+
+def pdh_gpu_split(mem_items, eng_items, pids, min_bytes=64 << 20):
+    """Windows' per-process GPU counters -> (bytes, percent) of the processes `pids`.  `mem_items`: (instance, bytes)
+    of `\\GPU Process Memory(*)\\Dedicated Usage`; `eng_items`: (instance, percent) of `\\GPU Engine(*)\\Utilization
+    Percentage`.  Only adapters on which `pids` hold `min_bytes` or more count (the NVIDIA card, not an iGPU that
+    draws the desktop).  The percent is Task Manager's: per adapter the busiest engine, the mean over the adapters."""
+    held = collections.Counter()
+    for name, v in mem_items:
+        pid, luid, _ = pdh_instance_pid(name)
+        if pid in pids and v:
+            held[luid] += v
+    luids = {l for l, b in held.items() if b >= min_bytes}
+    if not luids:
+        return None, None
+    engines = collections.defaultdict(float)
+    for name, v in eng_items:
+        pid, luid, eng = pdh_instance_pid(name)
+        if pid in pids and luid in luids and eng is not None:
+            engines[(luid, eng)] += v or 0.0
+    util = [max([v for (l, _), v in engines.items() if l == luid] or [0.0]) for luid in luids]
+    return sum(held[l] for l in luids), min(100.0, sum(util) / len(util))
+
+
+class _PdhGpu:
+    """Per-process VRAM and GPU load on Windows from the performance counters Task Manager reads (NVML reports no
+    per-process memory under WDDM).  Anything that fails leaves the readings None."""
+    PDH_FMT_DOUBLE, PDH_FMT_NOCAP100, PDH_MORE_DATA = 0x200, 0x8000, 0x800007D2
+
+    class Value(ctypes.Structure):
+        _fields_ = [("CStatus", ctypes.c_ulong), ("doubleValue", ctypes.c_double)]
+
+    class Item(ctypes.Structure):
+        _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", ctypes.c_byte * 16)]
+
+    def __init__(self):
+        self.pdh = self.q = None
+        if os.name != "nt":
+            return
+        try:
+            self.pdh = ctypes.WinDLL("pdh")
+            q = ctypes.c_void_p()
+            if self.pdh.PdhOpenQueryW(None, None, ctypes.byref(q)) != 0:
+                self.pdh = None
+                return
+            self.q = q
+            self.mem, self.eng = ctypes.c_void_p(), ctypes.c_void_p()
+            if (self.pdh.PdhAddEnglishCounterW(q, "\\GPU Process Memory(*)\\Dedicated Usage", None,
+                                               ctypes.byref(self.mem)) != 0 or
+                    self.pdh.PdhAddEnglishCounterW(q, "\\GPU Engine(*)\\Utilization Percentage", None,
+                                                   ctypes.byref(self.eng)) != 0):
+                self.pdh = None
+                return
+            self.pdh.PdhCollectQueryData(q)     # the engine counter is a rate: the next collect gives the first value
+        except (AttributeError, OSError):
+            self.pdh = None
+
+    def ok(self):
+        return self.pdh is not None
+
+    def _array(self, counter):
+        size, count = ctypes.c_ulong(0), ctypes.c_ulong(0)
+        fmt = self.PDH_FMT_DOUBLE | self.PDH_FMT_NOCAP100
+        r = self.pdh.PdhGetFormattedCounterArrayW(counter, fmt, ctypes.byref(size), ctypes.byref(count), None)
+        if (r & 0xFFFFFFFF) != self.PDH_MORE_DATA or size.value == 0:
+            return []
+        buf = ctypes.create_string_buffer(size.value)
+        if self.pdh.PdhGetFormattedCounterArrayW(counter, fmt, ctypes.byref(size), ctypes.byref(count), buf) != 0:
+            return []
+        items = ctypes.cast(buf, ctypes.POINTER(self.Item))
+        out = []
+        for i in range(count.value):
+            v = self.Value.from_buffer_copy(bytes(items[i].FmtValue))
+            if v.CStatus in (0, 1):             # PDH_CSTATUS_VALID_DATA, PDH_CSTATUS_NEW_DATA
+                out.append((items[i].szName or "", v.doubleValue))
+        return out
+
+    def read(self, pids):
+        if not self.ok():
+            return None, None
+        try:
+            if self.pdh.PdhCollectQueryData(self.q) != 0:
+                return None, None
+            return pdh_gpu_split(self._array(self.mem), self._array(self.eng), pids)
+        except (AttributeError, OSError, ValueError):
+            return None, None
+
+
+class _ProcTree:
+    """CPU, RAM and disk reads of one process and everything it started (the server: the engine, the vision helper,
+    replicas, MCP servers it launched).  Needs psutil."""
+
+    def __init__(self, ps, root_pid):
+        self.ps, self.root_pid, self.procs, self._io_prev = ps, root_pid, {}, None
+        self.ncpu = ps.cpu_count() or os.cpu_count() or 1
+
+    def pids(self):
+        try:
+            root = self.ps.Process(self.root_pid)
+            tree = [root] + root.children(recursive=True)
+        except (self.ps.Error, OSError):
+            return set()
+        live = {}
+        for p in tree:
+            old = self.procs.get(p.pid)
+            try:
+                same = old is not None and old.create_time() == p.create_time()   # not a new process with an old pid
+            except (self.ps.Error, OSError):
+                same = False
+            live[p.pid] = old if same else p
+        self.procs = live
+        return set(live)
+
+    def read(self):
+        """{"cpu": percent of ALL logical CPUs, "ram": resident private bytes, "disk_read_mb": MB/s}."""
+        self.pids()
+        cpu = ram = rd = 0.0
+        for p in list(self.procs.values()):
+            try:
+                with p.oneshot():
+                    cpu += p.cpu_percent(interval=None)      # the first call per process reads 0: a baseline
+                    m = p.memory_info()
+                    # Linux: rss counts mapped file pages (an mmapped experts.bin) that the OS also counts as cache;
+                    # the private part is what "used" counts.  Windows: the working set.
+                    ram += m.rss - getattr(m, "shared", 0) if sys.platform.startswith("linux") else m.rss
+                    try:
+                        rd += p.io_counters().read_bytes
+                    except (AttributeError, self.ps.Error, OSError):
+                        pass
+            except (self.ps.Error, OSError):
+                continue
+        t = time.time()
+        prev, self._io_prev = self._io_prev, (t, rd)
+        disk = (max(0.0, rd - prev[1]) / (t - prev[0]) / 2**20) if prev and t > prev[0] else None
+        return {"cpu": min(100.0, cpu / self.ncpu), "ram": ram, "disk_read_mb": disk}
+
+
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
+    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, root_pid=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
         PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
-        cards, numbered as HIP numbers them, read from sysfs (#301)."""
+        cards, numbered as HIP numbers them, read from sysfs (#301).  `root_pid`: the process whose tree is Strata (the
+        server, which starts the engine): its share of the CPU, RAM, disk reads, VRAM and GPU load is recorded beside
+        the system's (strata_* keys), so the Monitor can show Strata + the rest = the total."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
@@ -405,6 +637,8 @@ class Telemetry:
         except ImportError:
             self.ps = None
         self.fallback = _CpuRamFallback()
+        self.tree = _ProcTree(self.ps, root_pid) if self.ps is not None and root_pid else None
+        self.pdh = _PdhGpu() if self.tree is not None and os.name == "nt" and not amd else None
         gpu_name = " + ".join(g.name() or "?" for _, g in self.gpus) if self.gpu.ok() else None
         win_amd = None
         if gpu_name is None and amd and os.name == "nt":
@@ -426,6 +660,7 @@ class Telemetry:
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
             "threads": os.cpu_count(),
             "psutil": self.ps is not None,
+            "strata_split": self.tree is not None,   # the strata_* readings are recorded
         }
         self._disk_prev = None
         self._stop = threading.Event()
@@ -477,12 +712,35 @@ class Telemetry:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
+        if self.tree is not None:
+            try:
+                s.update(self._strata())
+            except Exception:  # noqa: BLE001 - telemetry must never take the server down
+                pass
         if self.extra:
             try:
                 s.update(self.extra())
             except Exception:  # noqa: BLE001 - telemetry must never take the server down
                 pass
         return s
+
+    def _strata(self):
+        """Strata's own share of each reading (the process tree of `root_pid`); None where it cannot be read."""
+        t = self.tree.read()
+        out = {"strata_cpu": t["cpu"], "strata_ram": t["ram"], "strata_disk_read_mb": t["disk_read_mb"]}
+        pids = set(self.tree.procs)
+        mem = [getattr(g, "proc_mem", lambda _p: None)(pids) for _, g in self.gpus]
+        util = [getattr(g, "proc_util", lambda _p: None)(pids) for _, g in self.gpus]
+        out["gpus_strata"] = [{"index": i, "mem": m, "util": u} for (i, _), m, u in zip(self.gpus, mem, util)]
+        out["strata_gpu_mem"] = sum(mem) if mem and all(m is not None for m in mem) else None
+        out["strata_gpu_util"] = sum(util) / len(util) if util and all(u is not None for u in util) else None
+        if self.pdh is not None and (out["strata_gpu_mem"] is None or out["strata_gpu_util"] is None):
+            pm, pu = self.pdh.read(pids)        # WDDM: NVML has no per-process memory there
+            if out["strata_gpu_mem"] is None:
+                out["strata_gpu_mem"] = pm
+            if out["strata_gpu_util"] is None:
+                out["strata_gpu_util"] = pu
+        return out
 
     def close(self):
         """Ends the sampler thread (a server that stops, a test's service): it used to run for the life of the process."""
@@ -494,7 +752,8 @@ class Telemetry:
             with self.lock:
                 self.now = s
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                          "disk_read_mb", "tok_s", "prefill_tok_s_mean", "strata_cpu", "strata_ram",
+                          "strata_disk_read_mb", "strata_gpu_mem", "strata_gpu_util"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
             self._stop.wait(1.0)

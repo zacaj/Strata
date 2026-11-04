@@ -114,13 +114,13 @@ async function loadHealth() {
 // ------------------------------------------------------------------ Monitor
 const METRICS = [
   {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
-  {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100},
-  {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
+  {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100, split: true},
+  {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used", split: true},
   {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
   {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power"},
   {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
-  {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
-  {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
+  {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100, split: true},
+  {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info", split: true},
 ];
 $("metrics").innerHTML = METRICS.map((m) => `
   <div class="st-card metric-card"><div class="st-metric">
@@ -135,22 +135,47 @@ $("metrics").innerHTML = METRICS.map((m) => `
       stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
       ${m.key === "speed" ? `<g id="sp-prefill" class="speed-prefill"><path class="area" fill="currentColor" opacity=".12"/>
         <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
-        stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>
+        stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}
+      ${m.split ? `<g class="split"><path class="area" fill="currentColor"/><path class="line" fill="none"
+        stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"
+        vector-effect="non-scaling-stroke"/></g>` : ""}</svg>
   </div></div>`).join("");
 
-function spark(id, values, max) {
+// `base`: Strata's own share of the same series (the strata_* readings), drawn as a solid band under the total, so the
+// light band above it is everything else on the PC.  Without it the card is one series, as before.
+function spark(id, values, max, base) {
   const svg = $(id);
   const v = (values || []).map((x) => (x == null ? 0 : x));
-  if (v.length < 2) { svg.querySelector(".line").setAttribute("d", ""); svg.querySelector(".area").setAttribute("d", ""); return; }
+  const b = base && base.some((x) => x != null) ? base.map((x, i) => Math.min(x == null ? 0 : x, v[i] ?? 0)) : null;
+  const split = svg.querySelector(".split");
+  const draw = (g, d) => { g.querySelector(".line").setAttribute("d", d ? d : ""); g.querySelector(".area").setAttribute("d", d ? `${d}L100,32L0,32Z` : ""); };
+  if (split) { split.style.display = b ? "" : "none"; svg.toggleAttribute("data-split", !!b); }
+  if (v.length < 2) { draw(svg, ""); if (split) draw(split, ""); return; }
   const top = Math.max(max || 0, ...v, 1);
-  const pts = v.map((x, i) => [(i / (v.length - 1)) * 100, 30 - (x / top) * 26]);
-  const line = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
-  svg.querySelector(".line").setAttribute("d", line);
-  svg.querySelector(".area").setAttribute("d", `${line}L100,32L0,32Z`);
+  const path = (xs) => xs.map((x, i) => `${i ? "L" : "M"}${((i / (xs.length - 1)) * 100).toFixed(2)},${(30 - (x / top) * 26).toFixed(2)}`).join("");
+  draw(svg, path(v));
+  if (split && b) draw(split, path(b.slice(-v.length)));
+}
+// "Strata 41% · other 3%": a split card's sub line
+function splitSub(strata, total, f) {
+  if (strata == null || total == null) return null;
+  return {html: `<i class="seg" data-k="strata-line"></i>Strata ${esc(f(strata))} · ` +
+                `<i class="seg" data-k="other"></i>other ${esc(f(Math.max(0, total - strata)))}`};
+}
+// a segmented bar: [{k, label, bytes}], the remainder of `total` is "free"
+function stack(id, legendId, total, segs) {
+  const el = $(id), lg = $(legendId);
+  if (!total) { el.innerHTML = ""; lg.innerHTML = ""; return; }
+  const parts = segs.filter((x) => x.bytes > 0);
+  const free = Math.max(0, total - parts.reduce((a, x) => a + x.bytes, 0));
+  el.innerHTML = parts.map((x) => `<div class="seg" data-k="${x.k}" style="width:${Math.min(100, (100 * x.bytes) / total).toFixed(2)}%"
+    title="${esc(x.label)}: ${gb(x.bytes)} GB"></div>`).join("");
+  lg.innerHTML = [...parts, {k: "free", label: "free", bytes: free}].map((x) =>
+    `<span><i class="seg" data-k="${x.k}"></i>${esc(x.label)} ${gb(x.bytes)}</span>`).join("");
 }
 function setMetric(key, value, unit, sub) {
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
-  $(`ms-${key}`).textContent = sub || "";
+  if (sub && sub.html != null) $(`ms-${key}`).innerHTML = sub.html; else $(`ms-${key}`).textContent = sub || "";
 }
 
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
@@ -281,13 +306,16 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
   const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
   const multi = (hw.gpus || []).length > 1;
+  const pctf = (x) => `${fmt(x)}%`;
   setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
-            multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || (st.gpu_note ? "not available" : ""));
-  spark("sp-gpu", h.gpu_util, 100);
+            splitSub(hw.strata_gpu_util, hw.gpu_util, pctf) ||
+            (multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || (st.gpu_note ? "not available" : "")));
+  spark("sp-gpu", h.gpu_util, 100, h.strata_gpu_util);
   setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
             multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
-                  : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : (st.gpu_note ? "not available on Windows AMD yet" : ""));
-  spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
+                  : splitSub(hw.strata_gpu_mem, hw.gpu_mem_used, (x) => `${gb(x)} GB`) ||
+                    (eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : (st.gpu_note ? "not available on Windows AMD yet" : "")));
+  spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total, h.strata_gpu_mem);
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
             multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
   spark("sp-temp", h.gpu_temp, 90);
@@ -298,16 +326,21 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
             hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
             (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
   spark("sp-pcie", h.gpu_pcie_rx_mb);
-  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
-  spark("sp-cpu", h.cpu, 100);
+  // % of every logical CPU, Strata's included: the pool pins one thread per physical core, so on an SMT CPU its
+  // workers alone read about cores / threads (50% on 8 cores, 16 threads) whether they compute or wait
+  const threads = st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "";
+  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", splitSub(hw.strata_cpu, hw.cpu, pctf) || threads);
+  $("ms-cpu").title = threads;
+  spark("sp-cpu", h.cpu, 100, h.strata_cpu);
   if (hw.disk_read_mb == null) {
     setMetric("disk", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
   } else {
     const big = hw.disk_read_mb >= 1000;
     setMetric("disk", big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s",
-              hw.disk_write_mb == null ? "" : `write ${fmt(hw.disk_write_mb, 1)} MB/s`);
+              splitSub(hw.strata_disk_read_mb, hw.disk_read_mb, (x) => fmt(x, x < 10 ? 1 : 0)) ||
+              (hw.disk_write_mb == null ? "" : `write ${fmt(hw.disk_write_mb, 1)} MB/s`));
   }
-  spark("sp-disk", h.disk_read_mb);
+  spark("sp-disk", h.disk_read_mb, 0, h.strata_disk_read_mb);
 
   // context fill: the running request, else the last one
   const ctx = eng.max_context || 0;
@@ -319,13 +352,27 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
   $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
   $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
+  // VRAM and RAM as segments: the engine's own figures (expert cache, expert arena), the rest of Strata's process
+  // tree (weights, KV, buffers; strata_* readings), other programs, free.  Without the per-process readings the
+  // rest of the used memory is one segment.
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
-  $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
-  $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
-  $("ram-text").textContent = hw.ram_total ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} GB` : "–";
-  const ramPct = hw.ram_total ? (100 * hw.ram_used) / hw.ram_total : 0;
-  $("ram-bar").style.width = `${ramPct}%`;
-  if (ramPct > 92) $("ram-progress").dataset.tone = "danger"; else delete $("ram-progress").dataset.tone;
+  const vUsed = hw.gpu_mem_used || 0, vMine = hw.strata_gpu_mem;
+  $("vram-text").textContent = hw.gpu_mem_total ? `${gb(vUsed)} / ${gb(hw.gpu_mem_total, 0)} GB` +
+    (eng.expert_slots ? ` · ${fmt(eng.expert_slots)} experts` : "") : "–";
+  stack("vram-stack", "vram-legend", hw.gpu_mem_total, vMine == null
+    ? [{k: "experts", label: "experts", bytes: Math.min(cacheBytes, vUsed)},
+       {k: "used", label: "weights, KV, other programs", bytes: Math.max(0, vUsed - cacheBytes)}]
+    : [{k: "experts", label: "experts", bytes: Math.min(cacheBytes, vMine)},
+       {k: "strata", label: "Strata other", bytes: Math.max(0, vMine - cacheBytes)},
+       {k: "other", label: "other programs", bytes: Math.max(0, vUsed - vMine)}]);
+  const arena = (eng.arena_mib || 0) * 1048576, rUsed = hw.ram_used || 0, rMine = hw.strata_ram;
+  $("ram-text").textContent = hw.ram_total ? `${gb(rUsed)} / ${gb(hw.ram_total, 0)} GB` : "–";
+  stack("ram-stack", "ram-legend", hw.ram_total, rMine == null
+    ? [{k: "used", label: "used", bytes: rUsed}]
+    : [{k: "experts", label: "experts", bytes: Math.min(arena, rMine, rUsed)},
+       {k: "strata", label: "Strata other", bytes: Math.max(0, Math.min(rMine, rUsed) - arena)},
+       {k: "other", label: "other programs", bytes: Math.max(0, rUsed - rMine)}]);
+  $("ram-stack").dataset.tone = hw.ram_total && rUsed / hw.ram_total > 0.92 ? "danger" : "";
   $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
   $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
 

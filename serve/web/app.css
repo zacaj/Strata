@@ -99,6 +99,25 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-metric__spark .speed-prefill { color: color-mix(in srgb, var(--st-accent) 65%, black); }
 .st-metric__spark[data-tone="warn"] { color: var(--st-warn); }
 .st-metric__spark[data-tone="info"] { color: var(--st-info); }
+/* Strata + the rest = the total: the sparklines' Strata band and the segmented VRAM / RAM bars */
+.st-metric__spark .split { color: var(--st-accent); }
+.st-metric__spark .split .area { fill: color-mix(in srgb, var(--st-accent) 40%, var(--st-surface)); }
+.st-metric__spark[data-split] > .area { fill: var(--st-warn); opacity: .55; }
+.st-metric__spark[data-split] > .line { stroke: var(--st-warn); }
+.st-metric__sub i.seg { display: inline-block; width: 7px; height: 7px; border-radius: 2px; margin-right: 4px; }
+.st-metric__sub i.seg[data-k="strata-line"] { background: var(--st-accent); }
+.st-stack { display: flex; }
+.st-stack .seg { height: 100%; transition: width var(--st-dur) var(--st-ease); }
+.st-stack .seg + .seg { border-left: 1px solid var(--st-surface); }
+.seg[data-k="experts"] { background: var(--st-accent); }
+.seg[data-k="strata"] { background: color-mix(in srgb, var(--st-accent) 55%, var(--st-surface)); }
+.seg[data-k="other"] { background: var(--st-warn); }
+.seg[data-k="used"] { background: var(--st-ink-soft); }
+.stack-legend { display: flex; flex-wrap: wrap; gap: 2px var(--st-s-3); font-size: var(--st-fs-xs); color: var(--st-ink-muted);
+                font-variant-numeric: tabular-nums; margin-top: -2px; }
+.stack-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: -0px; }
+.stack-legend i.seg { height: 8px; }
+.stack-legend i[data-k="free"] { background: var(--st-surface-2); border: 1px solid var(--st-line); }
 .monitor-row { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(0, 2.4fr); gap: var(--st-s-4); }
 .ctx-card { display: flex; flex-direction: column; gap: var(--st-s-2); }
 .ctx-gauge { position: relative; width: 150px; height: 150px; margin: var(--st-s-2) auto var(--st-s-3); }
