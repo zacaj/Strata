@@ -43,6 +43,7 @@ if sys.platform == "win32":
 import contextlib
 import json
 import os
+import re
 import statistics
 import sys
 import threading
@@ -259,6 +260,9 @@ def run(cfg: dict, say=print, start_engine=None, *, progress=None, cancel_event=
         tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                            json.loads((tpath / "token_type.json").read_text()))
         ids_list = [chat_ids(tok, p) for p in PROMPTS]
+        if cfg.get("arch") == "qwen35moe":
+            return measure_q36(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(), doc_prompt(tok),
+                               log=cfg.get("log"), progress=progress, cancel_event=cancel_event)
         if progress is None and cancel_event is None:
             return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(), doc_prompt(tok),
                            hip=cfg.get("backend") == "hip")
@@ -458,6 +462,159 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     return {"settings": settings, "env": env, "report": report}
 
 
+# ---- Qwen3.6-35B-A3B (arch qwen35moe): its own engine path (src/qwen35) has none of the settings above.  It takes
+# --mtp N (a number of drafts), --pool-workers (the CPU threads for the experts that are not in VRAM) and --prefill
+# (the prompt chunk, which also decides how much VRAM is left for the expert slots), and learns its expert tier by itself.
+# Each value needs a restart (the hybrid fill alone takes ~45 s), so the three are tuned one after the other, each against
+# the winner of the one before: about 11 starts, 15-20 minutes.
+Q36_FLAGS = ("--mtp", "--pool-workers", "--prefill", "--chunk")
+Q36_MTP = (0, 1, 2, 3)
+Q36_CHUNKS = ("auto", "512", "1024")
+Q36_READ_TOKENS = 4096
+Q36_MIN_READ = 0.7                 # a chunk that reads prompts slower than this share of the current one is not kept
+
+
+def is_q36(args: list[str], settings: dict | None = None) -> bool:
+    """A Qwen3.6-A3B config: its --mtp is a number of drafts, Flash-Next's is the draft layer's folder."""
+    v = arg_value(args, "--mtp") or (settings or {}).get("--mtp")
+    return bool(v) and str(v).isdigit()
+
+
+def read_rate(eng, make, reads: list, n: int = Q36_READ_TOKENS) -> float:
+    """Prompt tokens per second of two fresh n-token prompts (after one that faults the weights in)."""
+    ms = toks = 0.0
+    for k in range(3):
+        reads[0] += 1
+        for _ in eng.generate(make(reads[0], n), 1, {"temperature": 0, "strata_checkpoint": False}, threading.Event()):
+            pass
+        last = eng.last or {}
+        if k:
+            ms += float(last.get("prompt_ms") or 0.0)
+            toks += float(last.get("prompt_read") or (last.get("prompt_tokens") or 0) - (last.get("reused") or 0))
+    return toks / (ms / 1000.0) if ms > 0 and toks > 0 else 0.0
+
+
+def engine_threads(log: str | None, since: int) -> int | None:
+    """The CPU threads the engine started with, from its own log line ("... rows on 8 CPU threads ...")."""
+    if not log:
+        return None
+    try:
+        with open(log, "rb") as f:
+            f.seek(since)
+            found = re.findall(r"rows on (\d+) CPU threads", f.read().decode("utf-8", "replace"))
+    except OSError:
+        return None
+    return int(found[-1]) if found else None
+
+
+def q36_workers(default: int, extra=()) -> list[int]:
+    """The engine's own thread count, fewer (two thirds, a half), one and a half times as many (the A3B's CPU share is
+    bigger than Flash-Next's, so the default can be low), plus the hybrid-CPU extras, at most 5 and no more than the PC has."""
+    top = os.cpu_count() or default
+    out = [default]
+    for w in (round(default * 2 / 3), round(default / 2), round(default * 1.5), *extra):
+        if 2 <= w <= top and w not in out:
+            out.append(w)
+    return out[:5]
+
+
+def measure_q36(base_args: list[str], ids_list, start_engine, say=print, extra_workers=(), long_prompt=None, *,
+                log: str | None = None, progress=None, cancel_event=None) -> dict:
+    t0 = time.time()
+    report: dict = {}
+    settings: dict = {}
+    since = os.path.getsize(log) if log and os.path.exists(log) else 0
+    cur_args = list(base_args)
+    reads = [0]
+
+    def try_value(args, what, with_read=False):
+        """A restart and two decode rates (and the prompt read speed): None when the engine does not start or dies."""
+        e = restart(start_engine, args, what, say, report)
+        if e is None:
+            return None
+        try:
+            s = Session(e, ids_list, cancel_event)
+            s.warm_up(1)
+            out = {"rates": [s.rate(), s.rate()]}
+            drafts = (e.last or {}).get("drafts_offered")
+            if drafts is not None:
+                out["drafts"] = [drafts, (e.last or {}).get("drafts_accepted")]
+            if with_read and long_prompt is not None:
+                out["read"] = read_rate(e, long_prompt, reads)
+            say(f"    {what}: {statistics.median(out['rates']):.1f} tok/s" +
+                (f", prompt read {out['read']:.0f} tok/s" if out.get("read") else ""))
+            return out
+        except CalibrationCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the engine died mid-measurement: this candidate loses (#1337)
+            say(f"    the engine died while measuring {what}: {first_line(exc)} - this candidate is dropped")
+            report.setdefault("failed_starts", {})[what] = first_line(exc)
+            return None
+        finally:
+            close(e)
+
+    def stage(name, flag, values, cur, label, with_read=False, cur_result=None):
+        """Every value against the current setting (restart each; the current one's measurement is reused when the
+        stage before made it).  Returns (value kept, its measurement)."""
+        nonlocal cur_args
+        got = {}
+        _progress(progress, name, 0, len(values))
+        for i, v in enumerate(values, 1):
+            _check_cancel(cancel_event)
+            say(f"  Measuring {label(v)} (restarts the engine) ...")
+            if v == cur and cur_result is not None:
+                got[v] = cur_result
+                say(f"    {label(v)}: {statistics.median(cur_result['rates']):.1f} tok/s (as measured)")
+            else:
+                r = try_value(with_arg(cur_args, flag, str(v)) if v != cur else cur_args, label(v), with_read)
+                if r:
+                    got[v] = r
+            _progress(progress, name, i, len(values))
+        report[name] = {str(k): v for k, v in got.items()}
+        med = {k: statistics.median(r["rates"]) for k, r in got.items()}
+        eligible = got
+        if with_read and got.get(cur, {}).get("read"):
+            floor = Q36_MIN_READ * got[cur]["read"]
+            eligible = {k: r for k, r in got.items() if k == cur or r.get("read", 0.0) >= floor}
+            for k in got.keys() - eligible.keys():
+                say(f"    {label(k)} reads prompts at {got[k].get('read', 0.0):.0f} against {got[cur]['read']:.0f} tok/s: "
+                    "not considered")
+        best = pick({k: r["rates"] for k, r in eligible.items()}, cur) if cur in got else cur
+        if best != cur:
+            cur_args = with_arg(cur_args, flag, str(best))
+            settings[flag] = str(best)
+        return best, got.get(best), med
+
+    # 1. the number of MTP drafts (0: none).  The file's own MTP block must be in the GGUF, or every value ties.
+    mtp_cur = int(arg_value(cur_args, "--mtp") or 0)
+    mtp_vals = sorted(set(Q36_MTP) | {mtp_cur})
+    mtp, res, _ = stage("mtp_drafts", "--mtp", mtp_vals, mtp_cur, lambda v: f"{v} MTP drafts")
+    if res and res.get("drafts") is not None and not res["drafts"][0] and mtp:
+        say("    the engine offered no drafts at all: this file may have no MTP block, so --mtp changes nothing")
+        report["mtp_note"] = "no drafts offered"
+    # 2. the CPU threads, with the draft count chosen.  The engine's own count is on its log line; without it (every
+    # expert in VRAM) there is no CPU share to tune.
+    d_workers = int(arg_value(cur_args, "--pool-workers") or 0) or engine_threads(log, since)
+    if d_workers:
+        cands = q36_workers(d_workers, extra_workers)
+        workers, res, _ = stage("cpu_workers", "--pool-workers", cands, d_workers, lambda v: f"{v} CPU threads",
+                                cur_result=res)
+        report["default_workers"] = d_workers
+    else:
+        _progress(progress, "cpu_workers", 1, 1)
+        say("  No CPU threads in the engine's log (every expert fits in VRAM?): not tuning --pool-workers.")
+    # 3. the prompt chunk.  Decode speed alone would always pick the small one (it leaves the most VRAM for expert
+    # slots), so the prompt read speed is measured too and a chunk that halves it is not kept.
+    flag = "--chunk" if "--chunk" in cur_args and "--prefill" not in cur_args else "--prefill"
+    chunk_cur = arg_value(cur_args, flag) or "auto"
+    chunk_vals = list(dict.fromkeys([chunk_cur, *Q36_CHUNKS]))
+    _, res, _ = stage("prompt_chunk", flag, chunk_vals, chunk_cur, lambda v: f"prompt chunk {v}", with_read=True)
+    report["seconds"] = round(time.time() - t0)
+    report["tok_s"] = round(statistics.median(res["rates"]), 1) if res else None
+    _check_cancel(cancel_event)
+    return {"settings": settings, "env": {}, "report": report}
+
+
 def first_line(exc: Exception) -> str:
     return str(exc).strip().splitlines()[0][:300] if str(exc).strip() else type(exc).__name__
 
@@ -525,8 +682,13 @@ DEFAULTS = {"--pcie-frac": None, "--spec-min-p": "0.5", "--pool-workers": None, 
 def apply(args: list[str], settings: dict) -> list[str]:
     """`args` with the calibrated settings; a setting the calibration did not change goes back to the product
     default (setup's --spec-min-p 0.5, the engine's own PCIe share and worker count), so an older calibration's
-    values never linger."""
+    values never linger.  A Qwen3.6-A3B config (--mtp N) is tuned against its own current values, so only the settings
+    the calibration changed are written and nothing else is added or reset."""
     out = list(args)
+    if is_q36(out, settings):
+        for flag, v in settings.items():
+            out = with_arg(out, flag, v)
+        return out
     for flag, default in DEFAULTS.items():
         out = with_arg(out, flag, settings.get(flag, default))
     return out

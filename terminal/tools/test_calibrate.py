@@ -612,5 +612,65 @@ class SetupIntegration(unittest.TestCase):
                       "settings", out.getvalue())
 
 
+class FakeQ36(FakeEngine):
+    """The A3B engine: decode speed from --mtp, --pool-workers and --prefill; prompt read speed from --prefill."""
+
+    def __init__(self, args, starts, speed, read):
+        self.args = list(args)
+        self.mtp = int(CAL.arg_value(args, "--mtp") or 0)
+        self.workers = int(CAL.arg_value(args, "--pool-workers") or 8)
+        self.chunk = CAL.arg_value(args, "--prefill") or "auto"
+        self.speed_f, self.read_f = speed, read
+        self.last, self.proc, self.info = {}, None, {}
+        starts.append(list(args))
+
+    def generate(self, ids, max_new, sampling, cancel):
+        for _ in range(max_new):
+            yield 1
+        rate = self.speed_f(self.mtp, self.workers, self.chunk)
+        self.last = {"generated": max_new, "decode_ms": max_new / rate * 1000.0, "drafts_offered": 5 if self.mtp else 0,
+                     "drafts_accepted": 3, "prompt_tokens": len(ids), "prompt_read": len(ids),
+                     "prompt_ms": len(ids) / self.read_f(self.chunk) * 1000.0}
+
+
+class CalibrateQ36(unittest.TestCase):
+    BASE = ["--native", "m.gguf", "--max-context", "32768", "--prefill", "auto", "--mtp", "2"]
+
+    def run_q36(self, speed, read, base=BASE):
+        starts = []
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "engine.log"
+            log.write_text("an earlier run\n")
+
+            def start(a):                      # the engine says its thread count when it starts, as the real one does
+                with open(log, "a") as f:
+                    f.write("strata-q36: hybrid experts: 64 of 256 per layer, the rest of a batch of <= 128 rows "
+                            "on 8 CPU threads, bigger prompt chunks streamed\n")
+                return FakeQ36(a, starts, speed, read)
+            res = CAL.measure_q36(base, [[1, 2, 3]] * 3, start, say=lambda *_: None,
+                                  long_prompt=lambda i, n: [1] * n, log=str(log))
+        return res, starts
+
+    def test_picks_drafts_threads_and_a_chunk_that_keeps_the_prompt_speed(self):
+        # 3 drafts and 5 threads decode fastest; chunk 512 decodes fastest of all but reads prompts at a third
+        speed = lambda m, w, c: 40.0 + {0: 0, 1: 3, 2: 8, 3: 12}[m] + (5 if w == 5 else 0) + {"auto": 0, "512": 4, "1024": 4}[c]
+        read = lambda c: {"auto": 1800.0, "512": 600.0, "1024": 1500.0}[c]
+        res, starts = self.run_q36(speed, read)
+        self.assertEqual(res["settings"], {"--mtp": "3", "--pool-workers": "5", "--prefill": "1024"})
+        out = CAL.apply(self.BASE, res["settings"])
+        self.assertEqual(CAL.arg_value(out, "--mtp"), "3")
+        self.assertNotIn("--spec-min-p", out)                 # none of Flash-Next's flags are added
+        self.assertLessEqual(len(starts), 14)
+
+    def test_no_gain_changes_nothing(self):
+        res, _ = self.run_q36(lambda m, w, c: 50.0, lambda c: 1000.0)
+        self.assertEqual(res["settings"], {})
+        self.assertEqual(CAL.apply(self.BASE, res["settings"]), self.BASE)
+
+    def test_flash_next_mtp_folder_is_not_an_a3b_config(self):
+        self.assertFalse(CAL.is_q36(["--mtp", "C:\\data\\mtp\\rt"]))
+        self.assertTrue(CAL.is_q36(["--mtp", "2"]))
+
+
 if __name__ == "__main__":
     unittest.main()
