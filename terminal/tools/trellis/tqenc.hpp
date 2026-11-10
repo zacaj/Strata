@@ -40,6 +40,7 @@ inline constexpr int kExperimentalVersion = 2;
 // ggml type ids of the fork (decoders exist) and the experimental ones (encoder + Strata CPU decoder only)
 enum Type : int {
     TQ2_T = 144, TQK6 = 145, TQK7 = 146,    // the fork's types (hashed point table)
+    TQP5 = 147, TQP6 = 148, TQP7 = 149,     // the fork's pair trellis (Gyro-L): 64 steps of 2 weights, the TQK rule
     TQK5X = 224, TQK4X = 225,               // experimental version 2: K = 5 / 4 with the computed (LUT-free) codebook, tq_computed.hpp
     TQK5T = 226, TQK4T = 227                // experimental version 1: K = 5 / 4 with the fork's point table (the first pilots)
 };
@@ -50,7 +51,9 @@ double codebook_rms(int type);
 
 /// bits per step (8, 6, 7, 5, 4), 0 for any other type.
 int type_kbits(int type);
-inline int block_bytes(int type) { return type_kbits(type) ? 2 + 4 * type_kbits(type) : 0; }
+/// TQP5-7: 64 steps of 2 weights (the first two values of a state's codebook entry), state(t) = bits [(63-t)K, +15).
+inline bool type_pair(int type) { return type >= TQP5 && type <= TQP7; }
+inline int block_bytes(int type) { return type_kbits(type) ? 2 + (type_pair(type) ? 8 : 4) * type_kbits(type) : 0; }
 
 struct Params {
     int iters = 3;        ///< scale refinement rounds after the first search (path given d -> d given path)
@@ -74,7 +77,7 @@ const int16_t* codebook_table(int type);                // 32768 * 4 int16, the 
 /// uploads this table; it must be built by the host compiler (ggml-common-tq.h makes its table __device__ under hipcc).
 const float* point_table();                     // 4096 floats
 
-/// The state of step t (0..31) of a block's stream, by the decoder's rule, written bit by bit (independent of
+/// The state of step t (0..31, TQP 0..63) of a block's stream, by the decoder's rule, written bit by bit (independent of
 /// tq_states.hpp).  qs = the 4K stream bytes.
 uint32_t block_state(int type, const uint8_t* qs, int t);
 
@@ -90,7 +93,7 @@ BlockResult encode_block(int type, const float* w, const float* h, uint8_t* dst,
 double encode_blocks(int type, const float* w, const float* h, int64_t nblocks, uint8_t* dst, const Params& p,
                      int nthreads, double* err_out, int64_t* nonfinite, int64_t* zero_blocks);
 
-/// TEST HOOK: one Viterbi pass over a scaled target (T[p][4] = weights / d of processing position p, H[p][4]) and the
+/// TEST HOOK: one Viterbi pass over a scaled target (T[p][4], 64 positions for TQP = weights / d of processing position p, H[p][4]) and the
 /// legal-path states by position.  rot = first position processed, fixed_c = tail-biting group (-1 free).
 float debug_viterbi(int type, const float (*T)[4], const float (*H)[4], int rot, int fixed_c, uint16_t* st);
 /// Group sizes: predecessor groups G of a type; processing position p -> weight index of component j.

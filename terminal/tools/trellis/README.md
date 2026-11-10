@@ -14,6 +14,7 @@ type, layout or default; the engine's CPU decoder only gains K = 5 and 4 (ids 22
 | `tqenc.hpp`, `tqenc.cpp` | the encoder: tail-biting Viterbi on the 2^15-state shift trellis, fp16 scale refinement, importance weights; a C API |
 | `tqenc_test.cpp` | the tests (about 64,000 checks): streams and the circular wrap, Viterbi against a naive DP, planted solutions, bit-exact decode against `tq_states.hpp` and the scalar / AVX2 / AVX-512 kernels, special blocks, thread determinism, quality against the rate-distortion limit |
 | `tqenc_hip.cpp`, `tqenc_hip_test.cpp` | the same search on a GPU (HIP, gfx1201): bit-identical blocks, about 20 M weights/s on one R9700 |
+| `tqenc_cuda.cu` | the same on an NVIDIA GPU (same C API, `tqh_encode`), plus TQ2_T, which the HIP encoder leaves to the CPU. TQ2_T blocks are identical to the CPU encoder's (2048/2048, with and without importance); 13.7 M weights/s at iters 1 on an RTX 5060 Ti (sm_120, CUDA 13.0), the CPU encoder 0.36 M/s on the same PC's 16 threads (AVX2). `tqenc_hip_test.cpp` tests either library |
 | `../tqenc.py` | Python wrapper (ctypes): `encode`, `decode`, the input-only block-128 Hadamard, signs, the `.tqx` container |
 | `pilot.py`, `pilot_summary.py` | the block-quality pilot on a source GGUF (local files or HTTP range requests) |
 | `gyro_reencode.py`, `gyro_vs_original.py`, `gyro_error_profile.py`, `hf_slice.py` | checks against agentionai's Gyro files and the original Qwen weights |
@@ -23,6 +24,14 @@ Build and test (Linux x86-64, g++ with AVX2; the GPU part needs ROCm):
     sh tools/trellis/build.sh test && build-tqenc/tqenc_test          # --quick skips the quality table
     sh tools/trellis/build.sh lib  && python3 tools/trellis/test_tqenc_py.py
     sh tools/trellis/build.sh hip  && HIP_VISIBLE_DEVICES=3 build-tqenc/tqenc_hip_test
+
+CUDA on Windows (a "x64 Native Tools" prompt; MSVC defines neither `__FMA__` nor `__builtin_ctz`, so `tqenc.cpp` needs a
+forced-include header that defines `__FMA__` / `__F16C__` and maps `__builtin_ctz` to `_tzcnt_u32`):
+
+    cl /O2 /MD /std:c++17 /EHsc /arch:AVX2 /FImsvc_shim.h /Itools\trellis /Iinclude /Isrc\kernels\cpu /Ithird_party\ggml /c tools\trellis\tqenc.cpp
+    nvcc -O3 -std=c++17 -arch=sm_120 -Xcompiler /MD -Itools\trellis -c tools\trellis\tqenc_cuda.cu
+    nvcc -shared -arch=sm_120 -Xcompiler /MD tqenc_cuda.obj tqenc.obj -o tqenc_cuda.dll
+    set TQENC_HIP_LIB=...\tqenc_cuda.dll   (tools/tqenc.py: encode(..., gpu=True))
 
 `build.sh hip` compiles `tqenc.cpp` with g++ on purpose: under hipcc, `ggml-common-tq.h` turns its codebook into a
 `__device__` variable and the host side reads zeros.

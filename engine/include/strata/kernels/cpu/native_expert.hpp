@@ -68,6 +68,16 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 /// h (n_ff floats) -> the down activation (h_bytes), rotated first when the layer is Hadamard-folded.
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 
+/// STRATA_ACT_DUMP_EXPERTS=1 (research, with STRATA_ACT_DUMP and its layers): whether the per-expert dump is on, and one
+/// record of the vector that enters expert `expert` - kind 0 the gate/up input x (n_embd), kind 1 the down input h (n_ff),
+/// both before the layer's Hadamard rotation, which this applies.
+bool native_act_dump_experts_on();
+void native_act_dump_expert(const NativeFmt& f, int kind, int expert, const float* v);
+/// STRATA_ACT_DUMP_RAW=<tokens> (research, with STRATA_ACT_DUMP and its layers): one token's routed ids and expert input x
+/// (not rotated), for the first <tokens> tokens of each dumped layer.
+bool native_act_dump_raw_on();
+void native_act_dump_raw(int layer, const float* x, int64_t n_embd, const int32_t* ids, int k);
+
 /// From how many tokens native_gu_rows gives this gate/up type to a multi-token kernel (#152; ggml-cpu's per-token dot
 /// below that).  1: a token's rows are the same alone and in any group.
 int native_gu_mt_min(int gu_type);

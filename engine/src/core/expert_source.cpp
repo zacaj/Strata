@@ -5748,6 +5748,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
         const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
         for (int64_t t = 0; t < n_tok; ++t) {
+            if (native && strata::kernels::cpu::native_act_dump_raw_on())   // research: the token as the experts see it
+                strata::kernels::cpu::native_act_dump_raw((int) d.layers, x_f + (size_t) t * H, H, ids + t * k, (int) k);
             if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
             if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
                 act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
@@ -5854,6 +5856,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 nj.blob = b;
                 nj.nt = 0;
                 nj.fmt = nullptr;
+                nj.expert = (int) e;
                 if (zc) {   // 149-cold mode 3: the gate rows are the blob; up and down at their distance in the mapping
                     if (d.zc_fmt.size() < d.jobs_multi.size()) d.zc_fmt.resize(d.jobs_multi.size());
                     strata::kernels::cpu::NativeFmt& f = d.zc_fmt[(size_t) jo];
@@ -5876,6 +5879,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 nj.nt = 0;
             }
             ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
+            if (native && strata::kernels::cpu::native_act_dump_experts_on())   // research: the input of this (token, expert)
+                strata::kernels::cpu::native_act_dump_expert(lay.fmt[(size_t) d.layers], 0, (int) e, x_f + (size_t) t * H);
             jb.act[jb.nt] = &d.act_multi[(size_t) t];
             jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
             jb.out[jb.nt] = row;

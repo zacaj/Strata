@@ -491,6 +491,10 @@ bool native_experts_available() noexcept { return false; }
 bool native_fmt(int, int, int64_t, int64_t, NativeFmt&, std::string& err) { err = "built without native experts"; return false; }
 void native_quant_act(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_quant_h(const NativeFmt&, const float*, void*) { std::abort(); }
+bool native_act_dump_experts_on() { return false; }
+void native_act_dump_expert(const NativeFmt&, int, int, const float*) {}
+bool native_act_dump_raw_on() { return false; }
+void native_act_dump_raw(int, const float*, int64_t, const int32_t*, int) {}
 int native_gu_mt_min(int) { return 2; }
 void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 void native_down_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }

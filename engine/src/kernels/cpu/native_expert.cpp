@@ -481,6 +481,7 @@ void ActDump::act_dump_flush() {
         std::fwrite(kv.second.sq.data(), 8, kv.second.sq.size(), f);
         if (!kv.second.cov.empty()) std::fwrite(kv.second.cov.data(), 8, kv.second.cov.size(), f);
         std::fclose(f);
+        std::remove(path.c_str());   // Windows: rename does not replace an existing file
         std::rename((path + ".tmp").c_str(), path.c_str());
     }
 }
@@ -508,7 +509,124 @@ void act_dump_record(int layer, int kind, const float* v, int64_t n) {
         d.mu.lock();
     }
 }
+// STRATA_ACT_DUMP_EXPERTS=1 (research, off by default): beside the layer dump, the per-expert second moments - for
+// every routed (token, expert) pair, sum x^2 of the vector entering that expert, in the experts' basis.  A full
+// covariance per expert (512 x 2560^2 doubles, 27 GB a layer) is out of reach; the diagonal per expert with the layer's
+// pooled correlation gives H_e = D_e^1/2 R D_e^1/2 (tools/trellis).  Files <prefix>_L<l>_<gu|dn>_experts.bin: int64 n,
+// int64 n_expert, int64 count [n_expert], double sum x^2 [n_expert][n]; written at exit.
+struct ExpertAcc {
+    int64_t n = 0;
+    std::vector<int64_t> count;
+    std::vector<double> sq;
+};
+struct ExpertDump {
+    bool on = false;
+    std::map<std::pair<int, int>, ExpertAcc> acc;
+    std::mutex mu;
+    ExpertDump() {
+        const char* e = std::getenv("STRATA_ACT_DUMP_EXPERTS");
+        on = act_dump().on && e != nullptr && std::atoi(e) != 0;
+        if (on) std::atexit([] { flush(); });
+    }
+    static void flush();
+};
+constexpr int kDumpExperts = 512;
+ExpertDump& expert_dump() {
+    static ExpertDump* d = new ExpertDump;   // never destroyed: the atexit flush must still find it
+    return *d;
+}
+void ExpertDump::flush() {
+    ExpertDump& d = expert_dump();
+    std::lock_guard<std::mutex> lk(d.mu);
+    const std::string& prefix = act_dump().prefix;
+    for (auto& kv : d.acc) {
+        const std::string path = prefix + "_L" + std::to_string(kv.first.first) + (kv.first.second ? "_dn" : "_gu") +
+                                 "_experts.bin";
+        FILE* f = std::fopen((path + ".tmp").c_str(), "wb");
+        if (!f) continue;
+        const int64_t ne = kDumpExperts;
+        std::fwrite(&kv.second.n, 8, 1, f);
+        std::fwrite(&ne, 8, 1, f);
+        std::fwrite(kv.second.count.data(), 8, kv.second.count.size(), f);
+        std::fwrite(kv.second.sq.data(), 8, kv.second.sq.size(), f);
+        std::fclose(f);
+        std::remove(path.c_str());
+        std::rename((path + ".tmp").c_str(), path.c_str());
+    }
+}
+// STRATA_ACT_DUMP_RAW=<tokens> (research, off by default): beside the layer dump, the first <tokens> tokens of each dumped
+// layer as they reach the experts - the routed ids and the input x itself (the layer's norm output, not rotated), so a
+// tool can rebuild the MoE output exactly (tools/trellis/proxy_moe.py).  File <prefix>_L<l>_raw.bin: int32 n_embd,
+// int32 k, then per token int32 ids [k], float x [n_embd].
+struct RawDump {
+    bool on = false;
+    int64_t cap = 0;
+    std::map<int, FILE*> files;
+    std::map<int, int64_t> written;
+    std::mutex mu;
+    RawDump() {
+        const char* e = std::getenv("STRATA_ACT_DUMP_RAW");
+        cap = e ? std::atoll(e) : 0;
+        on = act_dump().on && cap > 0;
+        if (on) std::atexit([] {
+            RawDump& d = raw_dump();
+            std::lock_guard<std::mutex> lk(d.mu);
+            for (auto& kv : d.files) std::fclose(kv.second);
+            d.files.clear();
+        });
+    }
+    static RawDump& raw_dump();
+};
+RawDump& RawDump::raw_dump() {
+    static RawDump* d = new RawDump;   // never destroyed: the atexit close must still find it
+    return *d;
+}
 }  // namespace
+
+bool native_act_dump_raw_on() { return RawDump::raw_dump().on; }
+
+void native_act_dump_raw(int layer, const float* x, int64_t n_embd, const int32_t* ids, int k) {
+    RawDump& d = RawDump::raw_dump();
+    if (!d.on) return;
+    const std::vector<int>& ls = act_dump().layers;
+    if (std::find(ls.begin(), ls.end(), layer) == ls.end()) return;
+    std::lock_guard<std::mutex> lk(d.mu);
+    int64_t& n = d.written[layer];
+    if (n >= d.cap) return;
+    FILE*& f = d.files[layer];
+    if (f == nullptr) {
+        f = std::fopen((act_dump().prefix + "_L" + std::to_string(layer) + "_raw.bin").c_str(), "wb");
+        if (f == nullptr) { n = d.cap; return; }
+        const int32_t hdr[2] = {(int32_t) n_embd, (int32_t) k};
+        std::fwrite(hdr, sizeof hdr, 1, f);
+    }
+    std::fwrite(ids, sizeof(int32_t), (size_t) k, f);
+    std::fwrite(x, sizeof(float), (size_t) n_embd, f);
+    ++n;
+}
+
+bool native_act_dump_experts_on() { return expert_dump().on; }
+
+void native_act_dump_expert(const NativeFmt& f, int kind, int expert, const float* v) {
+    ExpertDump& d = expert_dump();
+    if (!d.on || expert < 0 || expert >= kDumpExperts) return;
+    const std::vector<int>& ls = act_dump().layers;
+    if (std::find(ls.begin(), ls.end(), f.layer) == ls.end()) return;
+    const int64_t n = kind ? f.n_ff : f.n_embd;
+    thread_local std::vector<float> tmp;
+    tmp.assign(v, v + n);
+    if (kind ? f.had_d : f.had_gu) hadamard_rotate(tmp.data(), (int) n, f.had_block, kind ? f.d_signs : f.gu_signs);
+    std::lock_guard<std::mutex> lk(d.mu);
+    ExpertAcc& a = d.acc[{f.layer, kind}];
+    if (a.n == 0) {
+        a.n = n;
+        a.count.assign(kDumpExperts, 0);
+        a.sq.assign((size_t) kDumpExperts * (size_t) n, 0.0);
+    }
+    double* row = a.sq.data() + (size_t) expert * (size_t) n;
+    for (int64_t i = 0; i < n; ++i) row[i] += (double) tmp[(size_t) i] * tmp[(size_t) i];
+    ++a.count[(size_t) expert];
+}
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     if (f.had_gu) {   // Hadamard-folded gate/up: quantize H (s * x), never x itself (hadamard.hpp)

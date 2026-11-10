@@ -15,17 +15,20 @@ import pathlib
 import numpy as np
 
 TQ2_T, TQK6, TQK7, TQK5X, TQK4X, TQK5T, TQK4T = 144, 145, 146, 224, 225, 226, 227
+TQP5, TQP6, TQP7 = 147, 148, 149   # the pair trellis of Gyro-L: 64 steps of 2 weights, 2 + 8K bytes per block
 # TQK5X / TQK4X: experimental version 2, the computed (LUT-free) codebook (src/kernels/cpu/tq_computed.hpp);
 # TQK5T / TQK4T: version 1, the fork's point table (what the first pilots and the Gyro-S checks used for K5 / K4)
-TYPE_NAMES = {TQ2_T: "TQ2_T", TQK6: "TQK6", TQK7: "TQK7", TQK5X: "TQK5X", TQK4X: "TQK4X", TQK5T: "TQK5T", TQK4T: "TQK4T"}
+TYPE_NAMES = {TQ2_T: "TQ2_T", TQK6: "TQK6", TQK7: "TQK7", TQK5X: "TQK5X", TQK4X: "TQK4X", TQK5T: "TQK5T", TQK4T: "TQK4T",
+              TQP5: "TQP5", TQP6: "TQP6", TQP7: "TQP7"}
 TYPE_BY_NAME = {v: k for k, v in TYPE_NAMES.items()}
-KBITS = {TQ2_T: 8, TQK6: 6, TQK7: 7, TQK5X: 5, TQK4X: 4, TQK5T: 5, TQK4T: 4}
+KBITS = {TQ2_T: 8, TQK6: 6, TQK7: 7, TQK5X: 5, TQK4X: 4, TQK5T: 5, TQK4T: 4, TQP5: 5, TQP6: 6, TQP7: 7}
+PAIR = (TQP5, TQP6, TQP7)
 COMPUTED = (TQK5X, TQK4X)
 BLOCK = 128
 
 
 def block_bytes(t: int) -> int:
-    return 2 + 4 * KBITS[t]
+    return 2 + (8 if t in PAIR else 4) * KBITS[t]
 
 
 def bpw(t: int) -> float:
@@ -111,11 +114,19 @@ class _gpu_lock:
 
 
 def hip_lib() -> ctypes.CDLL:
-    """libtqenc_hip.so (sh tools/trellis/build.sh hip; run under the box GPU locks, HIP_VISIBLE_DEVICES picks the card)."""
+    """The GPU encoder: libtqenc_hip.so (sh tools/trellis/build.sh hip; run under the box GPU locks, HIP_VISIBLE_DEVICES
+    picks the card) or tqenc_cuda.dll / libtqenc_cuda.so (tools/trellis/tqenc_cuda.cu, the same C API).  TQENC_HIP_LIB
+    names either."""
     global _hip
     if _hip is None:
-        cands = [os.environ.get("TQENC_HIP_LIB", ""),
-                 str(pathlib.Path(__file__).resolve().parent.parent / "build-tqenc" / "libtqenc_hip.so")]
+        bd = pathlib.Path(__file__).resolve().parent.parent / "build-tqenc"
+        if os.name == "nt" and os.environ.get("CUDA_PATH"):   # the CUDA library's cuSOLVER / cuBLAS (Python skips PATH)
+            for sub in ("bin", os.path.join("bin", "x64")):
+                d = os.path.join(os.environ["CUDA_PATH"], sub)
+                if os.path.isdir(d):
+                    os.add_dll_directory(d)
+        cands = [os.environ.get("TQENC_HIP_LIB", ""), str(bd / "libtqenc_hip.so"), str(bd / "libtqenc_cuda.so"),
+                 str(bd / "tqenc_cuda.dll")]
         last = None
         for c in cands:
             if not c:
@@ -152,12 +163,14 @@ def encode(w: np.ndarray, t: int, h: np.ndarray | None = None, iters: int = 1, n
             raise ValueError("importance weights must have the shape of w")
         hp = h.ctypes.data
     if gpu:
-        if exact or t == TQ2_T:
-            raise ValueError("the GPU encoder has no exact search and no TQ2_T")
+        if exact:
+            raise ValueError("the GPU encoder has no exact search")
         with _gpu_lock() as gl:
             if gl.ok:
                 tot = hip_lib().tqh_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, scale_tries, 0,
                                            err.ctypes.data, stats.ctypes.data, None, 0)
+                if tot < 0:   # TQ2_T on the HIP encoder
+                    raise ValueError("this GPU encoder does not encode %s" % TYPE_NAMES[t])
                 return out, err, tot, {"nonfinite_blocks": int(stats[0]), "zero_blocks": int(stats[1])}
         threads = int(os.environ.get("TQENC_CPU_THREADS", threads or 24))   # the card stayed busy: the CPU encoder, same blocks
     tot = lib().tqe_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, exact, scale_tries, threads,

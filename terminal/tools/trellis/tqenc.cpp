@@ -74,7 +74,9 @@ int type_kbits(int type) {
     switch (type) {
         case TQ2_T: return 8;
         case TQK6: return 6;
-        case TQK7: return 7;
+        case TQK7: case TQP7: return 7;
+        case TQP6: return 6;
+        case TQP5: return 5;
         case TQK5X: case TQK5T: return 5;
         case TQK4X: case TQK4T: return 4;
         default: return 0;
@@ -134,6 +136,8 @@ struct Geo {
     int K = 0;
     bool t2 = false;   // TQ2_T (byte stream, the other shift direction)
     int G = 0;         // predecessor groups
+    int N = 32;        // steps per block (64 for TQP)
+    int D = 4;         // weights per step (2 for TQP: the first two values of the codebook entry)
 };
 
 Geo geo_for(int type) {
@@ -142,6 +146,7 @@ Geo geo_for(int type) {
     g.K = type_kbits(type);
     g.t2 = type == TQ2_T;
     g.G = g.t2 ? 128 : (1 << (15 - g.K));
+    if (type_pair(type)) { g.N = 64; g.D = 2; }
     return g;
 }
 
@@ -150,11 +155,11 @@ inline int gsucc(const Geo& g, uint32_t s) { return g.t2 ? (int) (s >> 8) : (int
 inline int gpred(const Geo& g, uint32_t s) { return g.t2 ? (int) (s & 0x7f) : (int) (s >> g.K); }
 
 // weight index (0..127) of component j of processing position p
-inline int widx(const Geo& g, int p, int j) { return g.t2 ? 4 * p + j : 4 * (31 - p) + j; }
+inline int widx(const Geo& g, int p, int j) { return g.t2 ? 4 * p + j : g.D * (g.N - 1 - p) + j; }
 
 struct Scratch {
     alignas(64) float D[2][kStates];        // the two live columns of the DP
-    alignas(64) uint16_t bp[32][2048];      // per step and predecessor group: the best predecessor state
+    alignas(64) uint16_t bp[64][2048];      // per step and predecessor group: the best predecessor state
     alignas(64) float m[2048];
     alignas(64) int32_t am[2048];
     alignas(64) float zero[kStates];
@@ -235,14 +240,15 @@ inline float min_arg_range(const float* p, int n, int* arg) {
 
 // T[p][4]: targets of processing position p (weights / d), H[p][4]: importance.  rot: the sequence is processed from
 // position rot (cyclically); fixed_c >= 0: tail-biting with the successor group of the first state and the predecessor
-// group of the last state both == fixed_c.  Writes the states by position into st[32]; returns the path cost.
+// group of the last state both == fixed_c.  Writes the states by position into st[g.N]; returns the path cost.  TQP:
+// components 2, 3 of T and H are zero, so the 4-wide step cost is the 2-wide one.
 float viterbi(const Geo& g, const float (*T)[4], const float (*H)[4], int rot, int fixed_c, uint16_t* st) {
     Scratch& sc = scratch();
-    const int K = g.K, G = g.G;
+    const int K = g.K, G = g.G, N = g.N, M = N - 1;
     float* cur = sc.D[0];
     // q = 0
     {
-        const int p = rot & 31;
+        const int p = rot & M;
         step_cost(*g.cbk, cur, sc.zero, 0, kStates, T[p], H[p]);
         if (fixed_c >= 0) {
             if (g.t2) {   // gsucc(s) = s >> 8 == c: the 256 states [c<<8, c<<8 + 256) allowed
@@ -254,10 +260,10 @@ float viterbi(const Geo& g, const float (*T)[4], const float (*H)[4], int rot, i
             }
         }
     }
-    for (int q = 1; q < 32; ++q) {
+    for (int q = 1; q < N; ++q) {
         const float* prev = cur;
         cur = sc.D[q & 1];
-        const int p = (rot + q) & 31;
+        const int p = (rot + q) & M;
         float* m = sc.m;
         uint16_t* bp = sc.bp[q];
         if (g.t2) {
@@ -312,30 +318,31 @@ float viterbi(const Geo& g, const float (*T)[4], const float (*H)[4], int rot, i
     }
     if (best < 0 || bc >= kInf * 0.5f) return kInf;
     uint32_t s = (uint32_t) best;
-    st[(rot + 31) & 31] = (uint16_t) s;
-    for (int q = 31; q >= 1; --q) {
+    st[(rot + M) & M] = (uint16_t) s;
+    for (int q = M; q >= 1; --q) {
         s = sc.bp[q][gsucc(g, s)];
-        st[(rot + q - 1) & 31] = (uint16_t) s;
+        st[(rot + q - 1) & M] = (uint16_t) s;
     }
     return bc;
 }
 
-// junction group of a free pass: gpred of the state at orig position 31 (== gsucc of the state at position 0)
-inline int junction_group(const Geo& g, const uint16_t* st) { return gpred(g, st[31]); }
+// junction group of a free pass: gpred of the state at the last position (== gsucc of the state at position 0)
+inline int junction_group(const Geo& g, const uint16_t* st) { return gpred(g, st[g.N - 1]); }
 
 struct Search {
     const Geo* g;
     const Params* p;
-    float T[32][4];
-    float H[32][4];
-    uint16_t st[32];
+    float T[64][4];
+    float H[64][4];
+    uint16_t st[64];
     int passes = 0;
 
     // one tail-biting search at scale d (weights already divided: set_targets); returns the path cost in scaled units
     float run() {
         static const int rots[8] = {16, 8, 24, 12, 20, 4, 28, 0};
         float best = kInf;
-        uint16_t tmp[32], free_st[32];
+        uint16_t tmp[64], free_st[64];
+        const int rs = g->N / 32;   // the rotations scale with the block's steps
         if (p->exact) {
             for (int c = 0; c < g->G; ++c) {
                 const float v = viterbi(*g, T, H, 0, c, tmp);
@@ -347,7 +354,7 @@ struct Search {
         int seen[8], ns = 0;
         const int nc = std::max(1, std::min(p->ncand, 8));
         for (int r = 0; r < nc; ++r) {
-            viterbi(*g, T, H, rots[r], -1, free_st);
+            viterbi(*g, T, H, rots[r] * rs, -1, free_st);
             ++passes;
             const int c = junction_group(*g, free_st);
             bool dup = false;
@@ -364,12 +371,12 @@ struct Search {
 
 void pack_stream(const Geo& g, const uint16_t* st, uint8_t* qs) {
     const int K = g.K;
-    std::memset(qs, 0, (size_t) 4 * K);
+    std::memset(qs, 0, (size_t) g.N / 8 * K);
     if (g.t2) {
         for (int t = 0; t < 32; ++t) qs[t] = (uint8_t) (st[t] & 0xff);
         return;
     }
-    for (int u = 0; u < 32; ++u) {
+    for (int u = 0; u < g.N; ++u) {
         const uint32_t x = st[u] & ((1u << K) - 1u);
         for (int b = 0; b < K; ++b)
             if ((x >> b) & 1u) qs[(u * K + b) >> 3] |= (uint8_t) (1u << ((u * K + b) & 7));
@@ -410,24 +417,24 @@ const float* point_table() {
 uint32_t block_state(int type, const uint8_t* qs, int t) {
     const int K = type_kbits(type);
     if (type == TQ2_T) return (((uint32_t) qs[(t + 31) & 31] << 8) | qs[t]) & 0x7fffu;
-    const int total = 32 * K;
+    const int n = type_pair(type) ? 64 : 32, total = n * K;
     uint32_t s = 0;
     for (int i = 0; i < 15; ++i) {
-        const int b = ((31 - t) * K + i) % total;
+        const int b = ((n - 1 - t) * K + i) % total;
         s |= (uint32_t) ((qs[b >> 3] >> (b & 7)) & 1u) << i;
     }
     return s;
 }
 
 void decode_blocks(int type, const uint8_t* src, int64_t nblocks, float* out) {
-    const int K = type_kbits(type), bb = 2 + 4 * K;
+    const int bb = block_bytes(type), D = type_pair(type) ? 2 : 4, n = 128 / D;
     for (int64_t b = 0; b < nblocks; ++b) {
         const uint8_t* blk = src + (size_t) b * bb;
         const uint16_t dh = (uint16_t) (blk[0] | (blk[1] << 8));
         const float d = half_to_float(dh);
-        for (int t = 0; t < 32; ++t) {
+        for (int t = 0; t < n; ++t) {
             const uint32_t s = block_state(type, blk + 2, t);
-            for (int j = 0; j < 4; ++j) out[b * 128 + 4 * t + j] = d * cb(type_computed(type)).soa[j][s];
+            for (int j = 0; j < D; ++j) out[b * 128 + D * t + j] = d * cb(type_computed(type)).soa[j][s];
         }
     }
 }
@@ -435,7 +442,7 @@ void decode_blocks(int type, const uint8_t* src, int64_t nblocks, float* out) {
 BlockResult encode_block(int type, const float* w, const float* h, uint8_t* dst, const Params& prm) {
     BlockResult r;
     const Geo g = geo_for(type);
-    const int K = g.K, bb = 2 + 4 * K;
+    const int bb = block_bytes(type), N = g.N, D = g.D;
     std::memset(dst, 0, (size_t) bb);
     double sumw2 = 0, sumhw2 = 0, amax = 0;
     for (int i = 0; i < 128; ++i) {
@@ -454,11 +461,13 @@ BlockResult encode_block(int type, const float* w, const float* h, uint8_t* dst,
     Search se;
     se.g = &g;
     se.p = &prm;
-    for (int p = 0; p < 32; ++p)
-        for (int j = 0; j < 4; ++j) se.H[p][j] = h ? h[widx(g, p, j)] : 1.0f;
+    std::memset(se.T, 0, sizeof se.T);
+    std::memset(se.H, 0, sizeof se.H);
+    for (int p = 0; p < N; ++p)
+        for (int j = 0; j < D; ++j) se.H[p][j] = h ? h[widx(g, p, j)] : 1.0f;
 
     double best_err = 1e300;
-    uint16_t best_st[32] = {};
+    uint16_t best_st[64] = {};
     uint16_t best_d = 0;
     bool have = false;
 
@@ -466,8 +475,8 @@ BlockResult encode_block(int type, const float* w, const float* h, uint8_t* dst,
         // err of (st, dh): sum h (w - d cv)^2
         const float d = half_to_float(dh);
         double e = 0;
-        for (int p = 0; p < 32; ++p)
-            for (int j = 0; j < 4; ++j) {
+        for (int p = 0; p < N; ++p)
+            for (int j = 0; j < D; ++j) {
                 const int wi = widx(g, p, j);
                 const float rec = d * g.cbk->soa[j][st[p]];
                 const double df = (double) w[wi] - rec;
@@ -484,8 +493,8 @@ BlockResult encode_block(int type, const float* w, const float* h, uint8_t* dst,
         if (prm.fixed_scale) dh = prm.fixed_scale;
         for (int it = 0; it <= (prm.fixed_scale ? 0 : prm.iters); ++it) {
             const float d = half_to_float(dh);
-            for (int p = 0; p < 32; ++p)
-                for (int j = 0; j < 4; ++j) se.T[p][j] = w[widx(g, p, j)] / d;
+            for (int p = 0; p < N; ++p)
+                for (int j = 0; j < D; ++j) se.T[p][j] = w[widx(g, p, j)] / d;
             if (se.run() >= kInf * 0.5f) break;
             double e;
             fit(se.st, dh, e);
@@ -498,8 +507,8 @@ BlockResult encode_block(int type, const float* w, const float* h, uint8_t* dst,
             if (e == 0.0 || prm.fixed_scale) break;
             // least-squares scale for this path
             double num = 0, den = 0;
-            for (int p = 0; p < 32; ++p)
-                for (int j = 0; j < 4; ++j) {
+            for (int p = 0; p < N; ++p)
+                for (int j = 0; j < D; ++j) {
                     const int wi = widx(g, p, j);
                     const double hi = h ? h[wi] : 1.0, c = g.cbk->soa[j][se.st[p]];
                     num += hi * w[wi] * c;

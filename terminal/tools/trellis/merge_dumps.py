@@ -10,8 +10,25 @@ import numpy as np
 
 out = pathlib.Path(sys.argv[1])
 out.mkdir(parents=True, exist_ok=True)
-names = sorted({p.name for d in sys.argv[2:] for p in pathlib.Path(d).glob("act_L*_*.bin") if p.name.startswith("act_L") and p.stat().st_size < 400_000_000})
-for name in names:
+names = sorted({p.name for d in sys.argv[2:] for p in pathlib.Path(d).glob("act_L*_*.bin") if p.name.startswith("act_L") and not p.name.endswith("_raw.bin") and p.stat().st_size < 400_000_000})
+for name in [x for x in names if x.endswith("_experts.bin")]:
+    # STRATA_ACT_DUMP_EXPERTS: int64 n, int64 n_expert, int64 count [n_expert], double sum x^2 [n_expert][n]
+    cnt, tot, n0, ne0 = None, None, None, None
+    for d in sys.argv[2:]:
+        p = pathlib.Path(d) / name
+        if not p.exists():
+            continue
+        raw = p.read_bytes()
+        n, ne = (int(v) for v in np.frombuffer(raw[:16], dtype=np.int64))
+        c = np.frombuffer(raw[16:16 + 8 * ne], dtype=np.int64)
+        sq = np.frombuffer(raw[16 + 8 * ne:16 + 8 * ne + 8 * ne * n], dtype=np.float64)
+        cnt = c.copy() if cnt is None else cnt + c
+        tot = sq.copy() if tot is None else tot + sq
+        n0, ne0 = n, ne
+    (out / name).write_bytes(np.array([n0, ne0], dtype=np.int64).tobytes() + cnt.tobytes() + tot.tobytes())
+    print("%-24s n %d experts %d  records %d  seen %d  median tokens per seen expert %.0f" % (
+        name, n0, ne0, cnt.sum(), (cnt > 0).sum(), np.median(cnt[cnt > 0])))
+for name in [x for x in names if not x.endswith("_experts.bin")]:
     tot, cnt, n0, cov = None, 0, None, None
     for d in sys.argv[2:]:
         p = pathlib.Path(d) / name

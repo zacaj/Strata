@@ -48,6 +48,67 @@ def feedback_matrices(R: np.ndarray, g: int = 128):
     return out
 
 
+def feedback(H: np.ndarray, damp: float = 0.01, gpu: bool = False):
+    """The feedback matrices of H: on the GPU (feedback_gpu) or with numpy."""
+    return feedback_gpu(H, damp) if gpu else feedback_matrices(hessian_factor(H, damp))
+
+
+def feedback_gpu(H: np.ndarray, damp: float = 0.01, g: int = 128):
+    """feedback_matrices(hessian_factor(H, damp)) computed by the CUDA encoder library (tqh_ldl_feedback, fp32, cuSOLVER),
+    or by numpy when that library has no such entry (the HIP one)."""
+    lib = tqenc.hip_lib()
+    fn = getattr(lib, "tqh_ldl_feedback", None)
+    if fn is None or g != 128:
+        return feedback_matrices(hessian_factor(H, damp), g)
+    import ctypes
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_double, ctypes.c_void_p, ctypes.c_int]
+    H = np.ascontiguousarray(H, dtype=np.float64)
+    n = H.shape[0]
+    sizes = [g * (n - c1) for c1 in range(g, n, g)]
+    buf = np.empty(sum(sizes), dtype=np.float32)
+    rc = fn(H.ctypes.data, n, float(damp), buf.ctypes.data, 0)
+    if rc != 0:
+        raise RuntimeError("tqh_ldl_feedback failed (%d): H + damping is not positive definite?" % rc)
+    out, at = [], 0
+    for c1, sz in zip(range(g, n, g), sizes):
+        out.append(buf[at:at + sz].reshape(g, n - c1))
+        at += sz
+    return out + [None]
+
+
+def encode_ldl_multi(jobs, t: int, gpu: bool = False, iters: int = 1, ncand: int = 1, threads: int = 0):
+    """encode_ldl for several matrices at once, each with its own feedback: jobs = [(W [m_i, n], fb_i)], all with the same
+    n.  Block column b of every matrix goes to ONE trellis encode call (the rows are independent), then each matrix takes
+    its own feedback step - the same blocks as encode_ldl matrix by matrix, in far fewer (GPU) calls.
+    Returns [(packed_i, decoded_i)]."""
+    n = jobs[0][0].shape[1]
+    B = n // 128
+    bb = tqenc.block_bytes(t)
+    Ws = [np.ascontiguousarray(W, dtype=np.float32).copy() for W, _ in jobs]
+    ms = [W.shape[0] for W in Ws]
+    off = np.cumsum([0] + ms)
+    packed = [np.empty((m, B, bb), dtype=np.uint8) for m in ms]
+    dec = [np.empty((m, n), dtype=np.float32) for m in ms]
+    kw = dict(iters=iters, ncand=ncand)
+    if gpu:
+        kw["gpu"] = True
+    else:
+        kw["threads"] = threads
+    for b in range(B):
+        c0, c1 = b * 128, (b + 1) * 128
+        blk = np.concatenate([W[:, c0:c1] for W in Ws])
+        pk, _, _, _ = tqenc.encode(blk, t, **kw)
+        q = tqenc.decode(pk, t).reshape(-1, 128)
+        for i, (W, (_, fb)) in enumerate(zip(Ws, jobs)):
+            r0, r1 = off[i], off[i + 1]
+            packed[i][:, b] = pk[r0:r1]
+            dec[i][:, c0:c1] = q[r0:r1]
+            if fb[b] is not None:
+                W[:, c1:] -= (blk[r0:r1] - q[r0:r1]) @ fb[b]
+    return list(zip(packed, dec))
+
+
 def encode_ldl(W: np.ndarray, t: int, fb, gpu: bool = False, iters: int = 1, ncand: int = 1, threads: int = 0):
     """W [m, n] float32 (n % 128 == 0), fb from feedback_matrices.  Returns (packed [m, n/128, block_bytes], decoded [m, n])."""
     m, n = W.shape

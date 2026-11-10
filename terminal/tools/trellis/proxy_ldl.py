@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import blockldl  # noqa: E402
 import gguf_reader  # noqa: E402
 import tqenc  # noqa: E402
-from build_swap import bf16, load_hessian  # noqa: E402
+from build_swap import bf16, load_expert_hessian, load_hessian  # noqa: E402
 
 
 def main() -> int:
@@ -36,6 +36,10 @@ def main() -> int:
     ap.add_argument("--damps", default="0.01")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--gpu", action="store_true")
+    ap.add_argument("--expert-h", action="store_true",
+                    help="per-expert H (STRATA_ACT_DUMP_EXPERTS): score each expert with its own held-out H, and add "
+                         "'ldle', ldl tuned with the expert's own H")
+    ap.add_argument("--kappa", type=float, default=64.0, help="--expert-h: pseudo-tokens of the pooled diagonal")
     a = ap.parse_args()
     g = gguf_reader.GGUFFile(a.gguf)
     fh = open(a.gguf, "rb")
@@ -56,8 +60,10 @@ def main() -> int:
             kind = "dn" if role == "down" else "gu"
             H = load_hessian(a.dump_dir, l, kind)
             Ht = load_hessian(a.test_dump_dir, l, kind) if a.test_dump_dir else H
-            fbs = {d: blockldl.feedback_matrices(blockldl.hessian_factor(H, d)) for d in damps}
+            fbs = {d: blockldl.feedback(H, d, gpu=a.gpu) for d in damps}
             for e in [int(x) for x in a.experts.split(",")]:
+                if a.expert_h:
+                    Ht = load_expert_hessian(a.test_dump_dir or a.dump_dir, l, kind, e, a.kappa)
                 W = bf16(np.asarray(gu_raw[e][:640] if role == "gate" else gu_raw[e][640:] if role == "up" else dn_raw[e]))
                 ti = by["blk.%d.ffn_%s_exps.weight" % (l, role)]
                 t = tqenc.TYPE_BY_NAME[ti.type_name]
@@ -72,14 +78,19 @@ def main() -> int:
                 for d in damps:
                     _, dec = blockldl.encode_ldl(Wr.astype(np.float32), t, fbs[d], gpu=a.gpu, threads=a.threads)
                     cands["ldl damp=%g" % d] = dec.astype(np.float64)
+                    if a.expert_h:
+                        fbe = blockldl.feedback(load_expert_hessian(a.dump_dir, l, kind, e, a.kappa), d, gpu=a.gpu)
+                        _, dec = blockldl.encode_ldl(Wr.astype(np.float32), t, fbe, gpu=a.gpu, threads=a.threads)
+                        cands["ldle damp=%g" % d] = dec.astype(np.float64)
                 den_u = float(np.sum(Wr ** 2))
                 den_h = float(np.trace(Wr @ Ht @ Wr.T))
                 for name, Q in cands.items():
                     E = Wr - Q
                     res.setdefault((l, role, name), []).append((float(np.sum(E ** 2) / den_u), float(np.trace(E @ Ht @ E.T) / den_h)))
                 print("layer %d %s expert %d done" % (l, role, e), flush=True)
-    names = ["shipped", "plain"] + ["ldl damp=%g" % d for d in damps]
-    print("\nrelative error in dB (higher is better): unweighted | H-weighted (%s)" % ("held-out H" if a.test_dump_dir else "same H"))
+    names = ["shipped", "plain"] + ["ldl damp=%g" % d for d in damps] + (["ldle damp=%g" % d for d in damps] if a.expert_h else [])
+    print("\nrelative error in dB (higher is better): unweighted | H-weighted (%s%s)" % (
+        "held-out H" if a.test_dump_dir else "same H", ", per expert" if a.expert_h else ""))
     tot = {n: [[], []] for n in names}
     for l in [int(x) for x in a.layers.split(",")]:
         for role in a.roles.split(","):
