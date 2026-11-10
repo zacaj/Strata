@@ -41,6 +41,7 @@
 #include "strata/qwen35/hybrid_fit.hpp"
 #include "q36_kernels.cuh"
 #if defined(STRATA_Q36_CPU_POOL)
+#include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #endif
@@ -1267,7 +1268,9 @@ struct Layer {
     float* router_ext = nullptr;     // the same with the shared expert's gate row appended: [n_expert + 1][N]
     Mat sh_gate, sh_up, sh_down;
     const float* sh_gate_inp = nullptr;   // [N]
-    K::NativeExpertLayout L;
+    K::NativeExpertLayout L;    // prism.hadamard: L.had_block / L.d_signs rotate the down input in the kernel
+    int had_gu = 0;             // prism.hadamard: gate/up folded, block size (the experts take H(signs * h), xq_r)
+    const float* gu_signs_d = nullptr;   // its DEVICE sign vector (n_embd) or nullptr
     uint8_t* blobs = nullptr;   // n_expert blobs, `stride` bytes apart (L.bytes rounded up to whole blocks of every
     size_t stride = 0;          // part's type, so MMQ can step over them by blocks), then kMmqTail zero bytes
                                 // (hybrid mode: n_slots slots, see place_experts)
@@ -1384,6 +1387,94 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
     return d;
 }
 
+/// prism.hadamard.* (routed experts stored in a block-Hadamard-rotated basis, hadamard.hpp) -> the process-wide spec.
+/// Only the routed experts of the main layers may be folded, and only the CPU expert path applies the rotation:
+/// place_experts keeps every expert of such a file on the CPU.  Anything else is refused, never run unrotated.
+static bool read_hadamard(const strata::GgufFile& f, int64_t n_layers, std::string& err) {
+#if defined(STRATA_Q36_CPU_POOL)
+    namespace C = strata::kernels::cpu;
+    C::HadamardSpec h;
+    const auto* ver = f.get("prism.hadamard.version");
+    if (ver == nullptr) {
+        C::hadamard_set(h);
+        return true;
+    }
+    const auto str = [&](const char* k) { const auto* v = f.get(k); return v ? v->s : std::string(); };
+    const auto* bs = f.get("prism.hadamard.block_size");
+    const auto* names = f.get("prism.hadamard.weight_names");
+    if (ver->num() != 1 || bs == nullptr || bs->u == 0 || (bs->u & (bs->u - 1)) ||
+        str("prism.hadamard.transform") != "normalized-sylvester-walsh-hadamard" ||
+        str("prism.hadamard.axis") != "input-last-dimension" || names == nullptr || names->items.empty()) {
+        err = "prism.hadamard: a version, block, transform or axis this engine does not take, or no weight names";
+        return false;
+    }
+    h.block = (int) bs->u;
+    h.roles.assign((size_t) n_layers, 0);
+    for (const auto& it : names->items) {
+        int l = -1;
+        char role[16] = {};
+        if (std::sscanf(it.s.c_str(), "blk.%d.ffn_%15[a-z]_exps.weight", &l, role) != 2 || l < 0 || l >= n_layers ||
+            it.s != "blk." + std::to_string(l) + ".ffn_" + role + "_exps.weight") {
+            err = "prism.hadamard folds " + it.s + "; strata-q36 rotates the main layers' routed experts only";
+            return false;
+        }
+        const std::string r = role;
+        h.roles[(size_t) l] |= r == "gate" ? 1u : r == "up" ? 2u : r == "down" ? 4u : 0u;
+    }
+    for (int64_t l = 0; l < n_layers; ++l)
+        if (((h.roles[(size_t) l] & 1u) != 0) != ((h.roles[(size_t) l] & 2u) != 0)) {
+            err = "prism.hadamard: layer " + std::to_string(l) + " folds only one of gate / up (they share one input)";
+            return false;
+        }
+    const std::string mode = str("prism.hadamard.sign_mode");
+    if (mode == "explicit") {
+        const auto* w = f.get("prism.hadamard.sign_widths");
+        const auto* v = f.get("prism.hadamard.sign_values");
+        size_t at = 0;
+        for (size_t i = 0; w && v && i < w->items.size(); ++i) {
+            const int64_t width = (int64_t) w->items[i].u;
+            if (width <= 0 || width % h.block || at + (size_t) width > v->items.size()) break;
+            std::vector<float>& s = h.signs[(int) width];
+            for (int64_t j = 0; j < width; ++j) {
+                const int64_t x = (int64_t) v->items[at + (size_t) j].u;
+                if (x != 1 && x != -1) break;
+                s.push_back((float) x);
+            }
+            at += (size_t) width;
+        }
+        if (!w || !v || w->items.empty() || at != v->items.size() || h.signs.size() != w->items.size()) {
+            err = "prism.hadamard: sign_widths / sign_values are inconsistent";
+            return false;
+        }
+        for (const auto& [width, s] : h.signs)
+            if ((int64_t) s.size() != width) {
+                err = "prism.hadamard: sign values must be +1/-1";
+                return false;
+            }
+    } else if (mode != "identity") {
+        err = "prism.hadamard: sign_mode " + mode + " is not identity or explicit";
+        return false;
+    }
+    C::hadamard_set(std::move(h));
+    return true;
+#else
+    if (f.get("prism.hadamard.version")) {
+        err = "prism.hadamard (rotated experts) needs the CPU expert pool, which this build does not have";
+        return false;
+    }
+    (void) n_layers;
+    return true;
+#endif
+}
+
+static bool hadamard_any() {
+#if defined(STRATA_Q36_CPU_POOL)
+    return strata::kernels::cpu::hadamard_spec().any();
+#else
+    return false;
+#endif
+}
+
 bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     const auto t0 = Clock::now();
     m.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
@@ -1395,6 +1486,7 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     }
     size_t checked = 0;
     if (!strata::core::check_gguf_layout(gm, m.g, err, &checked)) return false;
+    if (!read_hadamard(gm.meta(), m.g.n_layers, err)) return false;
     const auto& g = m.g;
     if (g.head_dim != 256 || g.ssm_state_size != 128 || g.ssm_d_conv != 4 || g.n_expert > 512 || m.top_k > 15) {
         err = "a geometry this driver's kernels do not take (head 256, state 128, conv 4, <= 512 experts, top-k <= 15)";
@@ -1454,8 +1546,9 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     m.layers.resize((size_t) g.n_layers);
     // the MTP block whenever the file has one, with or without drafts (--mtp): the VRAM it takes is then the same
     // either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on --mtp
-    (void) want_mtp;
-    m.has_mtp = g.n_mtp_layers > 0;
+    // STRATA_Q36_SKIP_MTP=1 (research, with --mtp 0): leave it out - a file whose MTP experts the kernels do not take
+    // (Unsloth's Q2_K / Q3_K) then loads for the main model's logits
+    m.has_mtp = g.n_mtp_layers > 0 && (want_mtp || std::getenv("STRATA_Q36_SKIP_MTP") == nullptr);
     for (int64_t l = 0; l < g.n_layers + (m.has_mtp ? 1 : 0); ++l) {
         const bool is_mtp = l == g.n_layers;
         Layer& y = is_mtp ? m.mtp : m.layers[(size_t) l];
@@ -1505,6 +1598,17 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
             return false;
         }
         y.L = K::native_expert_layout((int) tg->type, (int) td->type, g.n_embd, g.n_ff);
+        if (const auto& hs = strata::kernels::cpu::hadamard_spec(); hs.any() && (size_t) l < hs.roles.size()) {
+            namespace C = strata::kernels::cpu;   // the GPU slots' rotation (the CPU pool's: place_experts)
+            if (hs.down(l)) {
+                y.L.had_block = hs.block;
+                y.L.d_signs = K::hadamard_device_signs(C::hadamard_signs((int) g.n_ff), (int) g.n_ff);
+            }
+            if (hs.gu(l)) {
+                y.had_gu = hs.block;
+                y.gu_signs_d = K::hadamard_device_signs(C::hadamard_signs((int) g.n_embd), (int) g.n_embd);
+            }
+        }
         const size_t gsz = (size_t) g.n_ff * y.L.gu_row, dsz = (size_t) g.n_embd * y.L.d_row;
         // a stride in whole blocks of both parts' types (MMQ steps over the experts by blocks), 16-byte aligned
         const size_t al = lcm_sz(lcm_sz(block_bytes(y.L.gu_type), block_bytes(y.L.d_type)), 16);
@@ -1628,6 +1732,8 @@ struct Engine {
     float* hmain = nullptr;   // [tmax][N] the main model's final normed hidden of each row (the MTP seeds)
     float* hlast = nullptr;   // [N] that of the last processed position (zeros before the first): the current session's
     void *q8, *xq, *escr;
+    void* xq_r = nullptr;   // prism.hadamard: the routed experts' input, q8_1 of H(signs * h) (hr its floats)
+    float* hr = nullptr;
     int32_t *ids, *grp_start, *n_groups, *ent_dst, *ent_tok, *tok, *pos0, *pick;
     int32_t* hpin = nullptr;   // pinned staging: [0] decode token, [1] position, [2..9] picks, [10] max rows, [16..] tokens
     unsigned long long* grp_ptr;
@@ -1982,6 +2088,10 @@ struct Engine {
         const int max_in = (int) std::max<int64_t>({2 * g.n_embd, g.ssm_value_dim, g.n_head * g.head_dim, g.n_ff_shexp});
         CK(cudaMalloc(&q8, K::native_q8_1_bytes(max_in, 1) * T));
         CK(cudaMalloc(&xq, K::native_q8_1_bytes((int) N, 1) * T));
+        if (hadamard_any()) {
+            CK(cudaMalloc(&xq_r, K::native_q8_1_bytes((int) N, 1) * T));
+            hr = dalloc(T * N);
+        }
         x16 = dalloc_t<__half>(T * (size_t) max_in);
         if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas, st) != CUBLAS_STATUS_SUCCESS) {
             std::fprintf(stderr, "strata-q36: cuBLAS handle failed\n");
@@ -1993,6 +2103,7 @@ struct Engine {
         k16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
         v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
         q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
+        // Hadamard-folded experts: moe() rotates MMQ's inputs (hr, mq_h) as the grouped kernels' (expert_input)
         const bool mmq_avail = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
         auto mmq_ok = [&](const Layer& L) {
             return MMQ::supported(L.L.gu_type) && MMQ::supported(L.L.d_type) && MMQ::fits(L.L.gu_type, 2 * g.n_ff) &&
@@ -2007,7 +2118,7 @@ struct Engine {
         if (g.n_embd == FQ::kQ36Embd && g.n_ff == FQ::kQ36FF)
             for (size_t i = 0; i < n_state; ++i) {
                 const Layer& L = layer_at((int) i);
-                fused_on[i] = FQ::native_layer_ext(L.L.gu_type, L.L.d_type) ? 1 : 0;
+                fused_on[i] = (L.had_gu <= 0 && L.L.had_block <= 0 && FQ::native_layer_ext(L.L.gu_type, L.L.d_type)) ? 1 : 0;
             }
         // the route of each layer (q36_layer_route): fused > our int8 kernels (STRATA_EXPERT_I8=1) > MMQ > our int8 kernels > the grouped kernels.  A build without MMQ reads an unset
         // STRATA_EXPERT_I8 as 1 (the standalone engine does not link prefill.cpp's start-up list, so it tells the kernel library itself).
@@ -2022,7 +2133,7 @@ struct Engine {
         for (size_t i = 0; i < n_state; ++i) {
             const Layer& Li = layer_at((int) i);
             const bool mmq_takes = !fused_on[i] && mmq_avail && mmq_ok(Li);
-            const K::Q36Route r = K::q36_layer_route(fused_on[i] != 0, i8_raw, mmq_free, mmq_takes, !fused_on[i] && K::native_expert_i8_supported(Li.L));
+            const K::Q36Route r = K::q36_layer_route(fused_on[i] != 0, i8_raw, mmq_free, mmq_takes, !fused_on[i] && Li.had_gu <= 0 && Li.L.had_block <= 0 && K::native_expert_i8_supported(Li.L));
             const bool mq = r == K::Q36Route::Mmq;
             i8_on[i] = r == K::Q36Route::Int8 ? 1 : 0;
             if (r == K::Q36Route::Grouped) ++n_grouped;
@@ -2402,6 +2513,15 @@ struct Engine {
     }
     /// x [T][n] -> its q8_1 image (T contiguous columns: one vector of T * n), for every matrix that reads x.
     void quant(const float* xin, int n, int T, void* q) { K::native_quantize_q8_1(xin, q, n * T, 1, st); }
+    /// The routed experts' q8_1 input: xq, or for Hadamard-folded gate/up the rotated h in xq_r (the shared expert
+    /// keeps xq).
+    void* expert_input(const Layer& L, int T) {
+        if (L.had_gu <= 0) return xq;
+        const int N = (int) m->g.n_embd;
+        K::hadamard_rows(h, hr, T, N, L.had_gu, L.gu_signs_d, st);
+        quant(hr, N, T, xq_r);
+        return xq_r;
+    }
     // ---- decode kernels of this engine (q36_kernels.cuh), each the old kernel's bits (STRATA_Q36_VERIFY=1 compares)
     bool fast_k = std::getenv("STRATA_Q36_OLD_KERNELS") == nullptr;
     bool verify_k = std::getenv("STRATA_Q36_VERIFY") != nullptr;
@@ -2978,13 +3098,19 @@ struct Engine {
                     K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
                 }
             } else {
-                MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
+                const float* hx = h;   // prism.hadamard: the experts take H(signs * h)
+                if (L.had_gu > 0) {
+                    K::hadamard_rows(h, hr, T, N, L.had_gu, L.gu_signs_d, st);
+                    hx = hr;
+                }
+                MMQ::quantize(hx, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
                 MMQ::Product gu;
                 gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
                 gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = maxr;
                 gu.dst = mq_gu; gu.ld_dst = 2 * FF;
                 mctx->run(gu, st);
                 MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
+                if (L.L.had_block > 0) K::hadamard_rows(mq_h, mq_h, n_ent, FF, L.L.had_block, L.L.d_signs, st);
                 MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_ent, st);
                 MMQ::Product dn;
                 dn.w = wbase + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
@@ -2998,7 +3124,7 @@ struct Engine {
             group_entries(L, nullptr, T);
             if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
             K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
-                                     std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
+                                     std::min<int64_t>(n_ent, g.n_expert), n_ent, expert_input(L, T), escr, eparts, st);
         }
         // the shared expert, scaled by sigmoid(w . h)
         if (T > kGemmT) k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
@@ -3178,7 +3304,7 @@ struct Engine {
         group_entries(L, hy[li].slot_of_d, T);
         if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
         K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
-                                 std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
+                                 std::min<int64_t>(n_ent, g.n_expert), n_ent, expert_input(L, T), escr, eparts, st);
     }
     /// --peer-device, the batch path (S3): the entries whose expert lives on the second card are computed there.
     /// kind[] says who takes each entry of the batch - 0 card 0's slot, 1 the CPU pool, 2 the second card.  A card-0
@@ -3322,6 +3448,8 @@ struct Engine {
             if (row_ids.size() < m->layers.size()) row_ids.resize(m->layers.size());
             row_ids[li].assign(h_ids, h_ids + n_ent);
         }
+        if (C::native_act_dump_raw_on())   // research: the tokens as the experts see them (STRATA_ACT_DUMP_RAW)
+            for (int t = 0; t < T; ++t) C::native_act_dump_raw((int) li, h_h + (size_t) t * N, N, h_ids + (size_t) t * Kp, Kp);
         for (int e = 0; e < n_ent; ++e) {
             const int x = h_ids[e];
             if (!defer) H.score[(size_t) x] += 1.0;
@@ -4462,6 +4590,18 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         if (!alloc_vram((void**) &H.slot_of_d, (size_t) ne * 4, "expert slot table (H.slot_of_d)")) return false;
         CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
         if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, H.fmt, err)) return false;
+        H.fmt.layer = (int) li;   // STRATA_ACT_DUMP only: the layer of the dump files
+        if (const C::HadamardSpec& hs = C::hadamard_spec(); hs.any() && li < hs.roles.size()) {   // see read_hadamard
+            H.fmt.had_block = hs.block;
+            H.fmt.had_gu = hs.gu((int64_t) li);
+            H.fmt.had_d = hs.down((int64_t) li);
+            H.fmt.gu_signs = H.fmt.had_gu ? C::hadamard_signs((int) g.n_embd) : nullptr;
+            H.fmt.d_signs = H.fmt.had_d ? C::hadamard_signs((int) g.n_ff) : nullptr;
+            if (!hs.signs.empty() && ((H.fmt.had_gu && !H.fmt.gu_signs) || (H.fmt.had_d && !H.fmt.d_signs))) {
+                err = "prism.hadamard: no sign vector for layer " + std::to_string(li) + "'s expert width";
+                return false;
+            }
+        }
         if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
             err = "the CPU and GPU expert layouts differ";
             return false;
