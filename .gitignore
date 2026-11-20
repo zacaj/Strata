@@ -125,3 +125,8 @@ node_modules/
 /terminal/.venv-build/
 /.venv-build/
 *.json.bak
+third_party/llama.cpp-gyro/CMakeLists.txt
+/trace-*.json
+!/strata-*.json
+!/run-*.bat
+tmp/
