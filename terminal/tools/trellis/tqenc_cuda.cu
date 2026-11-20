@@ -468,8 +468,9 @@ void launch_pass(const Pass& P, int grid) {
 
 void launch_pass_k(int K, bool comp, bool t2, bool pair, const Pass& P, int grid) {
     if (t2) { launch_pass<8, false, true>(P, grid); return; }
-    if (pair) {   // TQP5 / TQP6 / TQP7
+    if (pair) {   // TQP5 / TQP6 / TQP7 / TQP8
         if (K == 5) launch_pass<5, false, false, true>(P, grid);
+        else if (K == 8) launch_pass<8, false, false, true>(P, grid);
         else if (K == 6) launch_pass<6, false, false, true>(P, grid);
         else launch_pass<7, false, false, true>(P, grid);
         return;
@@ -535,7 +536,7 @@ TQH_EXPORT double tqh_encode(int type, const float* w, const float* h, int64_t n
                              int fixed_scale_bits) {
     const int K = tqenc::type_kbits(type);
     const bool t2 = type == kTQ2T;
-    if (!t2 && (K < 4 || K > 7)) return -1.0;
+    if (!t2 && (K < 4 || K > (tqenc::type_pair(type) ? 8 : 7))) return -1.0;   // TQP8: K = 8 on the pair trellis
     const bool comp = tqenc::type_computed(type);
     const bool pair = tqenc::type_pair(type);
     const int NS = pair ? 64 : 32;   // steps per block

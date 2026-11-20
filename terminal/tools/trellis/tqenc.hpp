@@ -42,17 +42,18 @@ enum Type : int {
     TQ2_T = 144, TQK6 = 145, TQK7 = 146,    // the fork's types (hashed point table)
     TQP5 = 147, TQP6 = 148, TQP7 = 149,     // the fork's pair trellis (Gyro-L): 64 steps of 2 weights, the TQK rule
     TQK5X = 224, TQK4X = 225,               // experimental version 2: K = 5 / 4 with the computed (LUT-free) codebook, tq_computed.hpp
-    TQK5T = 226, TQK4T = 227                // experimental version 1: K = 5 / 4 with the fork's point table (the first pilots)
+    TQK5T = 226, TQK4T = 227,               // experimental version 1: K = 5 / 4 with the fork's point table (the first pilots)
+    TQP8 = 228                              // experimental: the pair trellis with K = 8 (4.125 bpw), the fork's point table
 };
 /// Whether the type's codebook is the computed one (TQK5X, TQK4X).
 bool type_computed(int type);
 /// rms of the codebook values (the first scale guess is rms(block) / this): 1.072 for the table, 0.88 for the computed code.
 double codebook_rms(int type);
 
-/// bits per step (8, 6, 7, 5, 4), 0 for any other type.
+/// bits per step (8, 6, 7, 5, 4; TQP8 8), 0 for any other type.
 int type_kbits(int type);
 /// TQP5-7: 64 steps of 2 weights (the first two values of a state's codebook entry), state(t) = bits [(63-t)K, +15).
-inline bool type_pair(int type) { return type >= TQP5 && type <= TQP7; }
+inline bool type_pair(int type) { return (type >= TQP5 && type <= TQP7) || type == TQP8; }
 inline int block_bytes(int type) { return type_kbits(type) ? 2 + (type_pair(type) ? 8 : 4) * type_kbits(type) : 0; }
 
 struct Params {

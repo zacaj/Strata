@@ -77,6 +77,7 @@ int type_kbits(int type) {
         case TQK7: case TQP7: return 7;
         case TQP6: return 6;
         case TQP5: return 5;
+        case TQP8: return 8;
         case TQK5X: case TQK5T: return 5;
         case TQK4X: case TQK4T: return 4;
         default: return 0;

@@ -16,13 +16,14 @@ import numpy as np
 
 TQ2_T, TQK6, TQK7, TQK5X, TQK4X, TQK5T, TQK4T = 144, 145, 146, 224, 225, 226, 227
 TQP5, TQP6, TQP7 = 147, 148, 149   # the pair trellis of Gyro-L: 64 steps of 2 weights, 2 + 8K bytes per block
+TQP8 = 228                         # experimental: the pair trellis with K = 8 (4.125 bpw)
 # TQK5X / TQK4X: experimental version 2, the computed (LUT-free) codebook (src/kernels/cpu/tq_computed.hpp);
 # TQK5T / TQK4T: version 1, the fork's point table (what the first pilots and the Gyro-S checks used for K5 / K4)
 TYPE_NAMES = {TQ2_T: "TQ2_T", TQK6: "TQK6", TQK7: "TQK7", TQK5X: "TQK5X", TQK4X: "TQK4X", TQK5T: "TQK5T", TQK4T: "TQK4T",
-              TQP5: "TQP5", TQP6: "TQP6", TQP7: "TQP7"}
+              TQP5: "TQP5", TQP6: "TQP6", TQP7: "TQP7", TQP8: "TQP8"}
 TYPE_BY_NAME = {v: k for k, v in TYPE_NAMES.items()}
-KBITS = {TQ2_T: 8, TQK6: 6, TQK7: 7, TQK5X: 5, TQK4X: 4, TQK5T: 5, TQK4T: 4, TQP5: 5, TQP6: 6, TQP7: 7}
-PAIR = (TQP5, TQP6, TQP7)
+KBITS = {TQ2_T: 8, TQK6: 6, TQK7: 7, TQK5X: 5, TQK4X: 4, TQK5T: 5, TQK4T: 4, TQP5: 5, TQP6: 6, TQP7: 7, TQP8: 8}
+PAIR = (TQP5, TQP6, TQP7, TQP8)
 COMPUTED = (TQK5X, TQK4X)
 BLOCK = 128
 

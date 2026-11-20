@@ -40,6 +40,7 @@ from build_swap import bf16, load_hessian, q8_0_quantize  # noqa: E402
 
 N_EXP, N_EMBD, N_FF, N_LAYER = 256, 2048, 512, 40
 TQP5, TQP6, TQP7 = 147, 148, 149
+TQP8 = tqenc.TQP8   # experimental (4.125 bpw): packs, but no engine here decodes it yet
 Q8_0 = 8
 SEED_GU, SEED_DN = 3601, 3602   # our Hadamard signs (any fixed vectors; the decoded weights are stored unrotated)
 
@@ -49,6 +50,8 @@ PLANS = {
     "iq3xxs": dict(base=(TQP5, TQP6),
                    layers={**{l: (TQP5, TQP7) for l in (2, 3, 4, 5, 6, 7, 31, 32, 33, 34, 35, 36, 37, 38)},
                            **{l: (TQP6, TQP7) for l in (0, 1, 39)}}),
+    # a 4-bit tier (4.125 bpw) against Unsloth's UD-Q4_K_XL (4.877 bpw: Q4_K gate/up, Q5_K / Q6_K down)
+    "tq4": dict(base=(TQP8, TQP8), layers={}),
 }
 
 
@@ -298,7 +301,7 @@ def main() -> int:
         # The TQP rows are in a Hadamard basis over their inputs: gate/up rows take H(s_gu * x), down rows take H(s_dn * y)
         # for its input y (H is tqenc.hadamard_matrix, 128 wide, per block)
         pk_dir = pathlib.Path(a.packed_dir)
-        by_name = {(tqenc.TYPE_NAMES[t], t) for t in (TQP5, TQP6, TQP7)}
+        by_name = {(tqenc.TYPE_NAMES[t], t) for t in (TQP5, TQP6, TQP7, TQP8)}
         if a.mtp_types != "keep":   # the MTP block: no BF16 for it (the BF16 release has none), so from the base's
             import subprocess
             import tempfile
