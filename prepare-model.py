@@ -50,7 +50,7 @@ def write_run_bat(name, serve_json):
             "@echo off\n"
             f"title Strata {name}\n"
             f'cd /d "{ROOT}"\n'
-            f'"{PY}" "{ROOT / "serve" / "server.py"}" "--engine" "strata" "--config" "{serve_json}" '
+            f'"{PY}" "{ROOT / "terminal" / "serve" / "server.py"}" "--engine" "strata" "--config" "{serve_json}" '
             f'"--port" "{cfg.get("port", 8080)}" "--host" "{cfg.get("host", "127.0.0.1")}"\n'
             "if errorlevel 1 pause\n", newline="\r\n")
         print(f"Wrote {run_bat.name}")
@@ -59,7 +59,7 @@ def write_run_bat(name, serve_json):
 def offer_calibration(serve_json):
     # Calibration: measures the hardware-dependent settings on this PC and writes the fastest into the config.
     if ask("Calibrate the settings for this PC now (~15-30 min, server must be stopped)?"):
-        sys.path.insert(0, str(ROOT / "tools"))
+        sys.path.insert(0, str(ROOT / "terminal" / "tools"))
         import calibrate as CAL
         cfg = json.loads(serve_json.read_text())
         res = CAL.run(cfg)
@@ -108,7 +108,7 @@ def main():
     if not gguf.is_file():
         sys.exit(f"not found: {gguf}")
     pack_opts = args
-    sys.path.insert(0, str(ROOT / "tools"))
+    sys.path.insert(0, str(ROOT / "terminal" / "tools"))
     import gguf_reader
     arch = gguf_reader.GGUFFile(gguf).metadata["general.architecture"]
     a3b = arch == "qwen35moe"
@@ -129,7 +129,7 @@ def main():
     ple = None
     m = re.match(r"(.*-)00001-of-(\d+)\.gguf$", gguf.name)
     if m:
-        sys.path.insert(0, str(ROOT / "tools"))
+        sys.path.insert(0, str(ROOT / "terminal" / "tools"))
         import gguf_reader
         for i in range(1, int(m.group(2)) + 1):
             cand = gguf.with_name(f"{m.group(1)}{i:05d}-of-{m.group(2)}.gguf")
@@ -142,7 +142,7 @@ def main():
         pass
     else:
         os.environ["STRATA_GGUF_PY"] = r"C:\programs\agention-llama.cpp\gguf-py"
-        cmd = [PY, r"tools\iq_pack.py", "--gguf", str(gguf), "--out", str(pack), *pack_opts]
+        cmd = [PY, r"terminal\tools\iq_pack.py", "--gguf", str(gguf), "--out", str(pack), *pack_opts]
         rc, out = run(*cmd, capture=True)
         if rc and "--compat-bf16" in out and "--compat-bf16" not in pack_opts and ask("The pack step needs --compat-bf16 (dequantizes those small projections to BF16). Retry with it?"):
             rc, out = run(*cmd, "--compat-bf16", capture=True)
@@ -186,7 +186,7 @@ def main():
         return c
 
     # Until this model has its own profile, borrow one with the same layers x experts.
-    sys.path.insert(0, str(ROOT / "tools"))
+    sys.path.insert(0, str(ROOT / "terminal" / "tools"))
     import gguf_reader
     meta = gguf_reader.GGUFFile(gguf).metadata
     arch = meta["general.architecture"]

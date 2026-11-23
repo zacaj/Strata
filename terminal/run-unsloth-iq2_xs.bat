@@ -1,0 +1,5 @@
+@echo off
+title Strata unsloth-iq2_xs
+cd /d "C:\programs\Strata"
+"C:\programs\Strata\terminal\.venv\Scripts\python.exe" "C:\programs\Strata\terminal\serve\server.py" "--engine" "strata" "--config" "C:\programs\Strata\terminal\strata-unsloth-iq2_xs.json" "--port" "8080" "--host" "0.0.0.0"
+if errorlevel 1 pause
