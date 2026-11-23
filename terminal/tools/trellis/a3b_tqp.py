@@ -243,7 +243,7 @@ def main() -> int:
                     "requantized from the base's (decoded with ikdeq) to types the expert kernels take; 'keep' keeps them")
     ap.add_argument("--out", required=True)
     ap.add_argument("--plan", default="iq3xxs", choices=sorted(PLANS))
-    ap.add_argument("--layers", default=None, help="tqp: only these layers (comma list); the rest stay the base file's")
+    ap.add_argument("--layers", default=None, help="tqp / pack: only these layers (comma list, or a range like 16-39); the rest stay the base file's")
     ap.add_argument("--dump-dir", default=None, help="tqp: the pooled STRATA_ACT_DUMP (with _COV) directory")
     ap.add_argument("--calib-dir", action="append", default=[], help="tqp: STRATA_ACT_DUMP_RAW directories")
     ap.add_argument("--packed-dir", default=None, help="tqp: also save the packed TQP tensors here")
@@ -260,7 +260,8 @@ def main() -> int:
     print("plan %s: %.3f bpw on the main experts (UD-IQ3_XXS: 2.889)" % (a.plan, plan_bpw(types)), flush=True)
     src = BF16Model(a.bf16)
     base = gguf_reader.GGUFFile(a.base)
-    layers = range(N_LAYER) if not a.layers else [int(x) for x in a.layers.split(",")]
+    layers = range(N_LAYER) if not a.layers else [i for x in a.layers.split(",") for i in (
+        range(int(x.split("-")[0]), int(x.split("-")[1]) + 1) if "-" in x else [int(x)])]
     replace = {}
     t0 = time.time()
     for r in (("gate", "up", "down") if a.mode != "pack" else ()):   # the MTP block (blk.40): zero Q8_0 experts
@@ -319,7 +320,7 @@ def main() -> int:
             for r, ty in (("gate", gu_ty), ("up", gu_ty), ("down", d_ty)):
                 nm = "blk.%d.ffn_%s_exps.weight" % (N_LAYER, r)
                 replace[nm] = (ids[ty], lambda t=bt[nm], ty=ty: requant(t, ty))
-        for l in range(N_LAYER):
+        for l in layers:   # --layers: the other layers keep the base's experts (e.g. K-quants for llama.cpp's CPU layers)
             for r in ("gate", "up", "down"):
                 f = [p for p in pk_dir.glob("L%d_%s.*" % (l, r))]
                 assert len(f) == 1, (l, r, f)
@@ -335,7 +336,7 @@ def main() -> int:
             "prism.hadamard.axis": "input-last-dimension",
             "prism.hadamard.sign_mode": "explicit",
             "prism.hadamard.weight_names": ["blk.%d.ffn_%s_exps.weight" % (l, r)
-                                            for l in range(N_LAYER) for r in ("gate", "up", "down")],
+                                            for l in layers for r in ("gate", "up", "down")],
             "prism.hadamard.sign_widths": np.array([N_EMBD, N_FF]),
             "prism.hadamard.sign_values": np.concatenate([sg, sd])})
         print("wrote %s: %.2f GB (%.0f s)" % (a.out, pos / 1e9, time.time() - t0))

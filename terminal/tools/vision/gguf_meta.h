@@ -136,14 +136,22 @@ inline bool copy_meta(const std::string& src, const std::string& dst, std::strin
 inline llama_model* strata_open_text_model(const std::string& model, std::string* how = nullptr) {
     llama_model_params mp = llama_model_default_params();
     mp.vocab_only = true;
-    const char* tmpdir = std::getenv("TMPDIR");
-    if (!tmpdir || !*tmpdir) tmpdir = std::getenv("TEMP");
-    if (!tmpdir || !*tmpdir) tmpdir = std::getenv("TMP");
-    if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
-    const std::string meta = std::string(tmpdir) + "/strata-vision-meta-" + std::to_string((long) STRATA_GETPID()) + ".gguf";
-    std::string err;
+    // each temporary directory in turn: a TMPDIR that names a missing folder (C:\tmp on Windows, set for MSYS tools)
+    // left the header copy unwritten and the file itself, with its Strata-private types, was all that was tried
+    std::string err, meta;
     llama_model* m = nullptr;
-    if (strata_gguf::copy_meta(model, meta, err)) {
+    bool copied = false;
+    for (const char* var : {"TMPDIR", "TEMP", "TMP"}) {
+        const char* dir = std::getenv(var);
+        if (!dir || !*dir) continue;
+        meta = std::string(dir) + "/strata-vision-meta-" + std::to_string((long) STRATA_GETPID()) + ".gguf";
+        if ((copied = strata_gguf::copy_meta(model, meta, err))) break;
+    }
+    if (!copied) {
+        meta = "/tmp/strata-vision-meta-" + std::to_string((long) STRATA_GETPID()) + ".gguf";
+        copied = strata_gguf::copy_meta(model, meta, err);
+    }
+    if (copied) {
         m = llama_model_load_from_file(meta.c_str(), mp);
         if (how) *how = m ? "header only" : "header copy was not accepted";
     } else if (how) *how = "header copy failed: " + err;
