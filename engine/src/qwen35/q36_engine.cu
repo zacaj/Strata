@@ -4085,8 +4085,14 @@ struct Engine {
     /// `cancel`: a stop asked for before the state moves keeps only x (the caller then emits no draft), so that a request
     /// stopped mid-answer leaves the state at the tokens it has shown: a conversation that continues from them (the server's
     /// hand-over of a stopped request to a batch slot) reuses it instead of reading them again.
+    /// `samp` (STRATA_Q36_SPEC_SAMPLED=1, a sampled request): the verify rows' tokens are SAMPLED instead of argmax'd.  It is
+    /// called as samp(row, host logits of that row) in row order and returns the token the request's chain draws there;
+    /// a draft is kept while it equals that token, and the first row that differs (or row D) ends the round, so the rows
+    /// after it draw nothing.  The text then has the distribution of one-token decoding (a point-mass draft, the standard
+    /// speculative-sampling rule).
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
-                  const std::atomic<bool>* cancel = nullptr) {
+                  const std::atomic<bool>* cancel = nullptr,
+                  const std::function<int32_t(int, std::vector<float>&)>* samp = nullptr) {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
@@ -4136,7 +4142,20 @@ struct Engine {
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
         int a = 0;
-        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        if (samp != nullptr) {
+            // row i's logits are logits + i * V; one row at a time, so a rejected draft costs no later row's copy or draw
+            const size_t V = (size_t) m->g.n_vocab;
+            std::vector<float> lg(V);
+            for (int i = 0; i <= D; ++i) {
+                CK(cudaMemcpyAsync(lg.data(), logits + (size_t) i * V, V * 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaStreamSynchronize(st));
+                hpin[2 + i] = (*samp)(i, lg);
+                if (i < D && hpin[2 + i] == drafts[(size_t) i]) ++a;
+                else break;
+            }
+        } else {
+            while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        }
         if (cancel != nullptr && cancel->load()) a = 0;
         for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
         commit(a + 1);
@@ -5316,12 +5335,21 @@ struct Serve {
         const char* finish = "length";
         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
         // text); sampled ones, and requests beside others, one token at a time
-        // (STRATA_Q36_MTP_SAMPLED=1: opt-in toggle allowing sampled requests to utilize MTP speculative drafting)
-        static const bool mtp_sampled = std::getenv("STRATA_Q36_MTP_SAMPLED") != nullptr && std::string(std::getenv("STRATA_Q36_MTP_SAMPLED")) != "0";
-        const bool spec = E.mtp_d > 0 && (!smp.needs_logits() || mtp_sampled) && !adm;
+        // STRATA_Q36_SPEC_SAMPLED=1: sampled requests (alone) draft too - each verify row is sampled and a draft is kept while it
+        // equals that sample (Engine::spec_step).  Off by default: the default path is unchanged.
+        static const bool spec_sampled = [] { const char* e = std::getenv("STRATA_Q36_SPEC_SAMPLED"); if (e == nullptr) e = std::getenv("STRATA_Q36_MTP_SAMPLED");   // upstream's name for the same switch
+            return e != nullptr && *e != '0'; }();
+        const bool spec = E.mtp_d > 0 && (!smp.needs_logits() || spec_sampled) && !adm;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
         int nx = smp.needs_logits() ? -1 : E.greedy();
+        bool have_nx = false;   // nx was already drawn by a speculative step's last verify row
+        std::vector<int32_t> shist;   // the penalty history a speculative step's rows draw with
+        const std::function<int32_t(int, std::vector<float>&)> row_sample = [&](int, std::vector<float>& lg) {
+            const int32_t t = sample(lg, smp, shist, rng);
+            shist.push_back(t);
+            return t;
+        };
         if (adm) {
             if (smp.needs_logits()) {
                 E.host_logits(lg);
@@ -5356,13 +5384,12 @@ struct Serve {
                          prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, cont ? "" : ", done at once");
             return;
         }
-        bool need_sample = smp.needs_logits();
         for (;;) {
-            if (need_sample) {
+            if (smp.needs_logits() && !have_nx) {
                 E.host_logits(lg);
                 nx = sample(lg, smp, hist, rng);
             }
-            need_sample = smp.needs_logits();
+            have_nx = false;
             auto emit = [&](int t) {   // false: the answer ends here
                 std::printf("T %d\n", t);
                 std::fflush(stdout);
@@ -5376,7 +5403,8 @@ struct Serve {
             if (!emit(nx)) break;
             if (n_active > 0) window();
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop);
+                if (smp.needs_logits()) shist = hist;   // x is already in hist (emit); the rows add what they draw
+                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop, smp.needs_logits() ? &row_sample : nullptr);
                 offered += E.mtp_d;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
@@ -5391,7 +5419,7 @@ struct Serve {
                     if (!emit(drafts[(size_t) i])) ended = true;
                 if (ended) break;
                 nx = picks[a];
-                need_sample = false;
+                have_nx = smp.needs_logits();
                 continue;
             }
             if (E.pos + 1 > E.ctx) break;
