@@ -1775,7 +1775,10 @@ def _tune(a: argparse.Namespace) -> int:
             else:
                 print(f"recommend none - {rep.get('reason')}")
             for f_ in rep.get("failures") or []:
-                print(f"  failed  #{f_['index']} {f_['status']}: {f_['reason'][:90]}")
+                first_, *rest_ = str(f_["reason"]).strip().splitlines() or [""]
+                print(f"  failed  #{f_['index']} {f_['status']}: {first_}")
+                for line_ in rest_:
+                    print(f"          {line_}")
         return 0
 
     if a.tune_command == "run":
@@ -1872,7 +1875,9 @@ def _tune_run(a: argparse.Namespace, *, store_root: Path) -> int:
             print("strata: this backend offers no searchable dimension for this engine, so the "
                   "sweep will measure the baseline and stop", file=sys.stderr)
 
-    job = tuning.Tuner(store_root, plan, measure)
+    # one line per step while it runs (json output stays machine-only); a sweep boots the model for every run, so it is silent for minutes otherwise
+    job = tuning.Tuner(store_root, plan, measure,
+                       progress=None if a.output == "json" else (lambda line: print(line, flush=True)))
     result = job.run()
 
     if a.output == "json":
@@ -1893,7 +1898,11 @@ def _tune_run(a: argparse.Namespace, *, store_root: Path) -> int:
     else:
         print(f"  trials    {ran} of {plan.max_trials}")
     for f in rep.get("failures") or []:
-        print(f"  failed    #{f['index']} {f['status']}: {f['reason'][:90]}")
+        # the whole reason: an engine prints its status lines first and its error last, so a cut keeps the wrong end
+        first, *rest = str(f["reason"]).strip().splitlines() or [""]
+        print(f"  failed    #{f['index']} {f['status']}: {first}")
+        for line in rest:
+            print(f"            {line}")
     if rep.get("drift") and rep.get("drift_material"):
         d = rep["drift"]
         print(f"  drift     baseline {d['first']:.1f} -> {d['last']:.1f} "

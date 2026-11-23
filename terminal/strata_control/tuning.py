@@ -363,7 +363,9 @@ class Tuner:
 
     def __init__(self, root: Path, plan: TuningPlan,
                  measure: Callable[[Candidate], dict[str, float]],
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 progress: Callable[[str], None] | None = None) -> None:
+        self.progress = progress          # one plain line per step (the CLI prints it); None says nothing
         self.id = plan.id
         self.root = Path(root) / plan.id
         self.plan = plan
@@ -467,13 +469,33 @@ class Tuner:
 
     # ---- the sweep -------------------------------------------------------
 
+    def _say(self, text: str) -> None:
+        """A progress line, with the time since the job started. A closed or broken output never stops a sweep."""
+        if self.progress is None:
+            return
+        try:
+            minutes, seconds = divmod(int(max(0.0, self.clock() - self.started_at)), 60)
+            self.progress(f"[{minutes:2d}:{seconds:02d}] {text}")
+        except Exception:  # noqa: BLE001
+            self.progress = None
+
+    def _say_result(self, candidate: Candidate) -> None:
+        if candidate.ok:
+            tps = candidate.median("tokens_per_s")
+            self._say(f"  -> {tps:.1f} tokens/s (median of {len(candidate.metrics)})" if tps is not None else "  -> measured")
+        else:
+            why = " ".join(str(candidate.reason).split())
+            self._say(f"  -> {candidate.status}: {why[:160]}{'...' if len(why) > 160 else ''}" if why else f"  -> {candidate.status}")
+
     def run(self) -> dict[str, Any]:
         try:
             self._acquire_lease()
             self._enter("measuring_baseline")
             baseline = Candidate(index=0, settings=dict(self.plan.fixed), kind="baseline",
                                  args=self._args_for(dict(self.plan.fixed)))
+            self._say("baseline: measuring the current settings (the model starts for each run, so this takes a while)")
             self._measure_candidate(baseline)
+            self._say_result(baseline)
             self.candidates.append(baseline)
             self.save()
 
@@ -484,7 +506,8 @@ class Tuner:
                                     "reason": "this backend offers no searchable dimension; "
                                               "the baseline was measured and nothing was compared"})
             if baseline.ok:
-                self._enter("searching", trials=min(len(grid), self.plan.max_trials))
+                planned_trials = min(len(grid), self.plan.max_trials)
+                self._enter("searching", trials=planned_trials)
                 started = self.clock()
                 for index, settings in enumerate(grid, start=1):
                     if self._cancel:
@@ -497,11 +520,15 @@ class Tuner:
                         break
                     candidate = Candidate(index=index, settings=settings,
                                           args=self._args_for(settings))
+                    self._say(f"trial {index} of {planned_trials}: "
+                              + (" ".join(f"{k} {v}" for k, v in candidate.args.items()) or "(the current settings)"))
                     self._measure_candidate(candidate)
+                    self._say_result(candidate)
                     self.candidates.append(candidate)
                     self.trials_run += 1
                     self.save()
             else:
+                self._say("the baseline could not be measured, so no trial was run")
                 self.events.append({"seq": len(self.events), "at": self.clock(),
                                     "state": "baseline_failed",
                                     "reason": baseline.reason or baseline.status})
@@ -512,7 +539,9 @@ class Tuner:
                 self._enter("rechecking_baseline")
                 again = Candidate(index=-1, settings=dict(self.plan.fixed), kind="recheck",
                                   args=self._args_for(dict(self.plan.fixed)))
+                self._say("re-measuring the baseline, to see whether the machine drifted during the sweep")
                 self._measure_candidate(again)
+                self._say_result(again)
                 again.index = len(self.candidates)
                 self.candidates.append(again)
 
@@ -614,6 +643,8 @@ class Tuner:
             dim = by_id.get(key)
             if dim is None or dim.benchmark_only:
                 continue
+            if value is None:
+                continue                # a held dimension (--hold): the flag stays as the configuration has it, never the text "None"
             flag = dim.flags[0]
             if isinstance(value, bool):
                 args[flag] = "1" if value else "0"
