@@ -63,7 +63,7 @@ def offer_calibration(serve_json):
         import calibrate as CAL
         cfg = json.loads(serve_json.read_text())
         res = CAL.run(cfg)
-        cfg["args"] = CAL.apply(cfg["args"], res["settings"])
+        cfg["args"] = CAL.apply(cfg["args"], res["settings"], cfg.get("arch"))
         if "env" in res:
             cfg["env"] = CAL.apply_env(cfg.get("env"), res["env"])
         serve_json.write_text(json.dumps(cfg, indent=2) + "\n")

@@ -378,7 +378,7 @@ def review(ref: str, report_path: Path) -> dict:
             reasons.append("source_engine_model_or_hardware_changed")
     except ProfileError as exc:
         reasons.append(f"identity_unavailable:{exc.exit_code}")
-    after = cal.apply(cfg["args"], report["settings"])
+    after = cal.apply(cfg["args"], report["settings"], cfg.get("arch"))
     return {"schema_version": 1, "report_id": report.get("report_id"), "profile": profile["id"] if profile else None,
             "source_config": str(path), "applicable": not reasons, "reasons": reasons,
             "settings": report["settings"], "before_args": cfg["args"], "after_args": after,

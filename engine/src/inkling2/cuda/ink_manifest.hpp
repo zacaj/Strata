@@ -103,10 +103,7 @@ struct InkManifest {
     bool has_dspark = false;
 
     const TensorInfo& get(const std::string& name) const {
-        auto it = trunk.find(name);
-        if (it != trunk.end()) return it->second;
-        auto it2 = dspark.find(name);
-        if (it2 != dspark.end()) return it2->second;
+        if (const TensorInfo* p = find(name)) return *p;
         std::fprintf(stderr, "strata-inkling: missing tensor '%s'\n", name.c_str());
         std::exit(2);
     }
@@ -115,6 +112,16 @@ struct InkManifest {
         if (it != trunk.end()) return &it->second;
         auto it2 = dspark.find(name);
         if (it2 != dspark.end()) return &it2->second;
+        // A drafter GGUF (dflash arch) is keyed without the "dspark." prefix (ink_gguf_loader.h map_dspark_name), the
+        // safetensors pack with it: accept either spelling.
+        static const std::string pfx = "dspark.";
+        if (name.compare(0, pfx.size(), pfx) == 0) {
+            auto it3 = dspark.find(name.substr(pfx.size()));
+            if (it3 != dspark.end()) return &it3->second;
+        } else {
+            auto it3 = dspark.find(pfx + name);
+            if (it3 != dspark.end()) return &it3->second;
+        }
         return nullptr;
     }
 };

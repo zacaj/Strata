@@ -8124,7 +8124,7 @@ def calibrate_config(cfg_path: Path) -> bool:
         if why:
             say(f"       the engine said: {why}")
         return False
-    cfg["args"] = CAL.apply(cfg["args"], res["settings"])
+    cfg["args"] = CAL.apply(cfg["args"], res["settings"], cfg.get("arch"))
     if "env" in res:                                   # HIP: the engine variables it measured (STRATA_SH_STREAM)
         cfg["env"] = CAL.apply_env(cfg.get("env"), res["env"])
     write_config(cfg_path, cfg)

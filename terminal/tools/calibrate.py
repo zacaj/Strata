@@ -234,6 +234,11 @@ def run(cfg: dict, say=print, start_engine=None, *, progress=None, cancel_event=
     `start_engine(args)` returns a started engine (serve.server.StrataEngine or a stand-in in tests).
     A supplied factory manages its own auxiliary resources."""
     with contextlib.ExitStack() as resources:
+        if start_engine is None and str(cfg.get("exe") or "").startswith("component:"):
+            # "component:strata-inkling" etc.: the engine package for this PC, resolved as the server resolves it.
+            # Unresolved, the start fails with WinError 2 and engine_args() drops the drafter and the image reader.
+            from serve.server import with_component_engine
+            cfg = with_component_engine(cfg)
         if start_engine is None:
             from serve.server import StrataEngine, Vision, child_env, vision_env
             env = child_env(cfg)
@@ -259,6 +264,10 @@ def run(cfg: dict, say=print, start_engine=None, *, progress=None, cancel_event=
             toks[i] = t
         tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                            json.loads((tpath / "token_type.json").read_text()))
+        if is_inkling(cfg.get("arch")):
+            ink_ids, ink_make = ink_prompts(tpath, tok)
+            return measure_inkling(engine_args(cfg), ink_ids, start_engine, say, ink_make,
+                                   progress=progress, cancel_event=cancel_event)
         ids_list = [chat_ids(tok, p) for p in PROMPTS]
         if cfg.get("arch") == "qwen35moe":
             return measure_q36(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(), doc_prompt(tok),
@@ -615,6 +624,121 @@ def measure_q36(base_args: list[str], ids_list, start_engine, say=print, extra_w
     return {"settings": settings, "env": {}, "report": report}
 
 
+# ---- Inkling-2 (arch inkling2*): its own engine (src/inkling2) has none of the Flash-Next settings either.  Two of its
+# flags are worth measuring: --draft (dspark drafting on, or off) by decode speed, and --chunk (the prompt chunk,
+# 512 by default) by prompt read speed.  --threads / --cpu-threads only matter when experts run on the CPU, and the
+# expert split (--vram-experts-gb / --ram-experts-gb) is setup's fit, not a speed setting.  One restart per value.
+INK_ARCHES = ("inkling2_loop", "inkling2", "inkling2_loop_text")
+INK_CHUNKS = (256, 512, 1024, 2048)
+INK_CHUNK_DEFAULT = 512
+
+
+def is_inkling(arch: str | None) -> bool:
+    return arch in INK_ARCHES
+
+
+def ink_prompts(tpath: Path, tok):
+    """Inkling's chat format (<|message_model|> ..., not <|im_start|>): the decode prompts and a `make(i, n)` for fresh
+    n-token reads, both rendered with the pack's own chat template as the server renders them."""
+    from serve.frontend import ChatTemplate
+    tpl = ChatTemplate(tpath / "chat_template.jinja")
+
+    def ids(text: str) -> list[int]:
+        return tok.encode(tpl.render([{"role": "user", "content": text}]), parse_special=True)
+
+    mark = "STRATACALBODY"
+    head_s, tail_s = tpl.render([{"role": "user", "content": f"[calibration read @] Summarize:\n{mark}"}]).split(mark)
+    text = "\n\n".join(p.read_text(encoding="utf-8", errors="replace") for p in sorted(
+        (ROOT / "docs" if (ROOT / "docs").is_dir() else ROOT.parent / "docs").glob("*.md")))
+    body = tok.encode(text, parse_special=False) or [0]
+    tail = tok.encode(tail_s, parse_special=True)
+
+    def make(i: int, n: int) -> list[int]:
+        head = tok.encode(head_s.replace("@", str(i)), parse_special=True)
+        return head + (body * (n // len(body) + 1))[:n] + tail
+    return [ids(p) for p in PROMPTS], make
+
+
+def measure_inkling(base_args: list[str], ids_list, start_engine, say=print, long_prompt=None, *,
+                    progress=None, cancel_event=None) -> dict:
+    t0 = time.time()
+    report: dict = {}
+    settings: dict = {}
+    cur_args = list(base_args)
+    reads = [0]
+
+    def try_value(args, what, with_read):
+        e = restart(start_engine, args, what, say, report)
+        if e is None:
+            return None
+        try:
+            s = Session(e, ids_list, cancel_event)
+            s.warm_up(1)
+            out = {"rates": [s.rate(), s.rate()]}
+            last = e.last or {}
+            if last.get("drafts_offered") is not None:
+                out["drafts"] = [last.get("drafts_offered"), last.get("drafts_accepted")]
+            if with_read and long_prompt is not None:
+                out["read"] = read_rate(e, long_prompt, reads)
+            say(f"    {what}: {statistics.median(out['rates']):.1f} tok/s" +
+                (f", prompt read {out['read']:.0f} tok/s" if out.get("read") else ""))
+            return out
+        except CalibrationCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the engine died mid-measurement: this candidate loses (#1337)
+            say(f"    the engine died while measuring {what}: {first_line(exc)} - this candidate is dropped")
+            report.setdefault("failed_starts", {})[what] = first_line(exc)
+            return None
+        finally:
+            close(e)
+
+    def run_stage(name, flag, values, cur, label, with_read, cur_result=None):
+        got = {}
+        _progress(progress, name, 0, len(values))
+        for i, v in enumerate(values, 1):
+            _check_cancel(cancel_event)
+            if v == cur and cur_result is not None:
+                got[v] = cur_result
+            else:
+                say(f"  Measuring {label(v)} (restarts the engine) ...")
+                r = try_value(with_arg(cur_args, flag, str(v)) if v != cur else cur_args, label(v), with_read)
+                if r:
+                    got[v] = r
+            _progress(progress, name, i, len(values))
+        report[name] = {str(k): r for k, r in got.items()}
+        return got
+
+    # 1. drafting: the config's mode (auto / dspark) against off, by decode speed
+    draft_cur = arg_value(cur_args, "--draft") or "auto"
+    got = run_stage("drafting", "--draft", list(dict.fromkeys([draft_cur, "off"])), draft_cur,
+                    lambda v: f"drafting {v}", with_read=False)
+    draft = pick({k: r["rates"] for k, r in got.items()}, draft_cur) if draft_cur in got else draft_cur
+    if draft != draft_cur:
+        cur_args = with_arg(cur_args, "--draft", draft)
+        settings["--draft"] = draft
+    res = got.get(draft)
+    # 2. the prompt chunk, by prompt read speed; a chunk that costs decode speed (VRAM taken from the experts) loses
+    chunk_cur = int(arg_value(cur_args, "--chunk") or INK_CHUNK_DEFAULT)
+    got = run_stage("prompt_chunk", "--chunk", sorted({chunk_cur, *INK_CHUNKS}), chunk_cur,
+                    lambda v: f"prompt chunk {v}", with_read=True)
+    base = got.get(chunk_cur)
+    if base and base.get("read"):
+        dec0 = statistics.median(base["rates"])
+        ok = {k: r for k, r in got.items()
+              if r.get("read") and statistics.median(r["rates"]) >= dec0 * (1.0 - MIN_GAIN)}
+        best = max(ok, key=lambda k: ok[k]["read"])
+        if best != chunk_cur and ok[best]["read"] > base["read"] * (1.0 + MIN_GAIN):
+            settings["--chunk"] = str(best)
+            res = ok[best]
+            say(f"    prompt chunk {best} reads {ok[best]['read']:.0f} against {base['read']:.0f} tok/s: kept")
+        else:
+            res = base
+    report["seconds"] = round(time.time() - t0)
+    report["tok_s"] = round(statistics.median(res["rates"]), 1) if res else None
+    _check_cancel(cancel_event)
+    return {"settings": settings, "env": {}, "report": report}
+
+
 def first_line(exc: Exception) -> str:
     return str(exc).strip().splitlines()[0][:300] if str(exc).strip() else type(exc).__name__
 
@@ -679,13 +803,13 @@ DEFAULTS = {"--pcie-frac": None, "--spec-min-p": "0.5", "--pool-workers": None, 
             "--adapt-every": None, "--adapt-swaps": None, "--adapt-decay": None, "--prefill-pipe": None}
 
 
-def apply(args: list[str], settings: dict) -> list[str]:
+def apply(args: list[str], settings: dict, arch: str | None = None) -> list[str]:
     """`args` with the calibrated settings; a setting the calibration did not change goes back to the product
     default (setup's --spec-min-p 0.5, the engine's own PCIe share and worker count), so an older calibration's
     values never linger.  A Qwen3.6-A3B config (--mtp N) is tuned against its own current values, so only the settings
     the calibration changed are written and nothing else is added or reset."""
     out = list(args)
-    if is_q36(out, settings):
+    if is_q36(out, settings) or is_inkling(arch):     # Inkling: likewise, only what was measured (no Flash-Next flags)
         for flag, v in settings.items():
             out = with_arg(out, flag, v)
         return out

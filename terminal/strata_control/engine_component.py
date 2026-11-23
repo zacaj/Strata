@@ -1241,12 +1241,35 @@ def is_reference(value: object) -> bool:
     return isinstance(value, str) and value.startswith(REFERENCE_PREFIX)
 
 
+#: A source checkout runs its own build: the newest engine program under <checkout>/build*/ wins over every installed
+#: package, with no signature or pin (STRATA_NO_LOCAL_BUILD=1 turns this off).
+CHECKOUT = Path(__file__).resolve().parents[2]
+_BUILD_GLOBS = ("build*/{exe}", "build*/bin/{exe}", "build*/src/*/{exe}")
+
+
+def local_build_exe(name: str) -> Path | None:
+    """The newest build of component `name` ("strata-engine", "strata-inkling" ...) in this checkout, or None."""
+    if os.environ.get("STRATA_NO_LOCAL_BUILD", "").strip().lower() in ("1", "true", "yes", "on"):
+        return None
+    from strata_control import shape_engine
+    shape = None if name in ("", COMPONENT_ID) else shape_engine.shape_of_component(name)
+    if shape is None and name not in ("", COMPONENT_ID):
+        return None
+    exe = shape_engine.exe_name(shape)
+    found = [p for g in _BUILD_GLOBS for p in CHECKOUT.glob(g.format(exe=exe)) if p.is_file()]
+    return max(found, key=lambda p: p.stat().st_mtime) if found else None
+
+
 def expand(value: str, cfg: dict | None = None, *, root: Path | None = None, full: bool = True) -> str:
     """The engine path for `value`: unchanged when it is a path, resolved when it is a component reference. This is the
     start path, so every file's SHA-256 is checked (`full`): a changed file refuses the start instead of running."""
     if not is_reference(value):
         return value
     name = value[len(REFERENCE_PREFIX):]
+    # a caller that names its components folder (a root, or STRATA_COMPONENTS_DIR: the app, the tests) gets that folder's packages
+    local = None if root is not None or os.environ.get(ENV_DIR) else local_build_exe(name)
+    if local is not None:
+        return str(local)
     backend = (cfg or {}).get("backend")
     if name not in ("", COMPONENT_ID):
         from strata_control import shape_engine
