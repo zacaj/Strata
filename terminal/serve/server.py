@@ -123,7 +123,7 @@ from serve.server_parts.base import (  # noqa: F401  (moved unchanged, file spli
     write_temporary,
 )
 from serve.server_parts.core import (  # noqa: F401  (moved unchanged, file split)
-    _positive_int, engine_params,
+    EFFECTIVE_SAMPLING_KEYS, _positive_int, engine_params,
     Detokenizer,
     NO_LINE,
     OPENAI_MAX_STOP,
@@ -4902,19 +4902,26 @@ class Service:
         if not s and not effort:
             return req
         req = dict(req)
+        defaulted = {}                      # what the server filled in, reported in strata_effective.defaulted
         if "max_tokens" in s and not req.get("max_tokens") and not req.get("max_completion_tokens"):
             req["max_tokens"] = s["max_tokens"]
+            defaulted["max_tokens"] = "shared settings"
         if effort:
+            where = "shared settings" if s.get("reasoning_effort") else "config reasoning_effort"
             if api == "openai":
                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
                 if req.get("reasoning_effort") in (None, "") and not req.get("reasoning") and \
                         "enable_thinking" not in ctk and "reasoning_effort" not in ctk:
                     req["reasoning_effort"] = effort
+                    defaulted["reasoning_effort"] = where
             elif not req.get("thinking") and not req.get("output_config"):
                 if effort == "none":
                     req["thinking"] = {"type": "disabled"}
                 else:
                     req["output_config"] = {"effort": effort}
+                defaulted["reasoning_effort"] = where
+        if defaulted:
+            req["strata_defaulted"] = defaulted
         return req
 
     def start_telemetry(self):
@@ -5366,6 +5373,11 @@ class Service:
             if ctx <= 0:
                 raise EngineStarting("the engine is starting (a minute or two); try again shortly")
         room = ctx - CTX_SLACK - len(ids)
+        if req is not None:            # what the template was given and what the request asked, for strata_effective
+            req["strata_prepared"] = {"max_tokens_requested": max_new if max_new and max_new > 0 else None,
+                                      "template": {k: kwargs[k] for k in ("reasoning_effort", "enable_thinking")
+                                                   if k in kwargs},
+                                      "prompt_tokens": len(ids), "context": ctx, "room": max(0, room)}
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
                 # A prompt refused for the context is not kept (#567): the client cannot resend it unchanged.  The
@@ -5578,6 +5590,14 @@ class Service:
         merged_sampling = dict(sampling or {})          # what the request resolved to, before any override below
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
+        budget_asked, budget_notes = budget, []
+        if budget:
+            s = sampling or {}
+            budget_source = ("request" if s.get("reasoning_budget_tokens") is not None
+                             or s.get("thinking_budget_tokens") is not None
+                             else "config" if self.reasoning_budget_tokens else "family default")
+        else:
+            budget_source = None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
             # 0.1.45: max_tokens counts the thinking too.  A client that caps the reply at 8192 (the desktop agent's
             # harness sends max_completion_tokens: 8192 on every request) and a task the model thinks long about got
@@ -5585,6 +5605,7 @@ class Service:
             # the answer its quarter of the cap (the budget's wrap-up: a short closing sentence, </think>, the answer).
             # A request with a budget of its own, or max_tokens below ANSWER_ROOM_MIN_CAP, is left as it was.
             budget = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+            budget_source = "answer_room"
             if max_new <= 32768: print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
                   "(\"answer_room\": false in the config turns this off)", flush=True)
         if budget and max_new and max_new > 0:
@@ -5595,6 +5616,8 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
+                budget_notes.append(f"budget {budget_asked} cut to {budget} to leave room for the answer")
+        budget_armed = budget                           # `budget` is cleared once it fires; strata_effective keeps this
         parser = self.parser_cls(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
                                  recover=self.tool_call_recovery, declared_only=declared_only,
                                  deferred=deferred or self.undeclared_tool_calls == "call")   # #4622: opt-in, as for a deferred tool
@@ -6228,15 +6251,28 @@ class Service:
                 "reasoning_recoveries": recovery_count,
                 # what took effect, for a caller that records it: the sampling after the merge with the defaults and
                 # after any recovery override, the output cap, and the thinking budget actually armed
-                "effective": {"sampling": {k: v for k, v in (sampling or {}).items() if k != "strata_img_keys"},
-                              "max_tokens": max_new, "thinking": bool(thinking), "reasoning_budget": budget}}
+                "effective": {"sampling": {k: v for k, v in (sampling or {}).items() if k in EFFECTIVE_SAMPLING_KEYS},
+                              "max_tokens": max_new, "thinking": bool(thinking), "reasoning_budget": budget_armed}}
+        prepared = (sampling or {}).get("strata_prepared") or {}
+        template = prepared.get("template") or {}
+        done["effective"].update({
+            "max_tokens_requested": prepared.get("max_tokens_requested"),   # None: none sent, the room left was used
+            "reasoning_effort": "none" if not thinking else template.get("reasoning_effort", "model default"),
+            "reasoning_budget_requested": budget_asked, "reasoning_budget_source": budget_source,
+            "reasoning_tokens": thinking_n, "answer_tokens": n - thinking_n,
+            "prompt_tokens": prepared.get("prompt_tokens"), "context": prepared.get("context"),
+            "answer_room": self.answer_room, "fit_max_tokens": self.fit_max_tokens})
+        if budget_notes:
+            done["effective"]["notes"] = budget_notes
+        if (sampling or {}).get("strata_defaulted"):
+            done["effective"]["defaulted"] = sampling["strata_defaulted"]
         if has_wire:                  # and what the engine got from it, defaults for the missing keys included
             wire = engine_params(self.engine.sampling_keys(sampling or {}))
             wire["seed_from"] = "server" if server_seed else "request" if wire["seed"] else "engine clock"
             done["effective"]["engine"] = wire
         if recovery_count:
             done["effective"]["sampling_before_recovery"] = {
-                k: v for k, v in merged_sampling.items() if k != "strata_img_keys"}
+                k: v for k, v in merged_sampling.items() if k in EFFECTIVE_SAMPLING_KEYS}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
             if finish == "length":
@@ -6492,7 +6528,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
                              "total_tokens": pt + x["completion_tokens"],
                              # the part of the prompt the conversation cache already held (OpenAI's field)
-                             "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
+                             "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0},
+                             "completion_tokens_details": {"reasoning_tokens": x.get("reasoning_tokens") or 0}}
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
             if x.get("rejected_tool_calls"):
@@ -8067,6 +8104,9 @@ def make_handler(svc: Service):
             tools, names, skipped = responses_api.request_tools(req)
             force = svc.force_text(forced_call(req.get("tool_choice"), tools))   # "required" / {"type": "function", "name": N}
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
+            if (req.get("reasoning") or {}).get("effort") is None and svc.effort_default():
+                req["strata_defaulted"] = {"reasoning_effort": "shared settings" if svc.shared.get("reasoning_effort")
+                                           else "config reasoning_effort"}
             try:
                 self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
             except ValueError as e:

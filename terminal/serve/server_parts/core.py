@@ -343,6 +343,12 @@ class ToolMarkupHold:
         return "".join(self.sent)
 
 
+# the request fields strata_effective.sampling echoes: the sampling ones, not the conversation the request also carries
+EFFECTIVE_SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty", "frequency_penalty",
+                           "presence_penalty", "penalty_last_n", "seed", "reasoning_budget_tokens",
+                           "thinking_budget_tokens")
+
+
 def _positive_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v > 0
 

@@ -1835,7 +1835,7 @@ class SharedPrefix(unittest.TestCase):
     def test_without_the_field_nothing_changes(self):
         req = {"temperature": 0}
         ids, _, _ = self.svc.prepare(self.MSGS, None, {}, 16, req=req)
-        self.assertEqual(req, {"temperature": 0})
+        self.assertEqual({k: v for k, v in req.items() if k != "strata_prepared"}, {"temperature": 0})
         self.assertEqual(ids, self.svc.prepare(self.MSGS, None, {}, 16)[0])
 
 
@@ -4261,6 +4261,16 @@ class UsageAndStatus(unittest.TestCase):
                          len(self.engine.last_prompt))
         self.assertGreater(u["output_tokens"], 0)
         self.assertEqual(self.chat("/v1/messages")["strata_effective"]["max_tokens"], 20)
+
+    def test_effective_reports_the_thinking_settings(self):
+        for path in ("/v1/chat/completions", "/v1/messages"):
+            e = self.chat(path)["strata_effective"]
+            for key in ("max_tokens_requested", "reasoning_effort", "reasoning_budget", "reasoning_budget_source",
+                        "reasoning_tokens", "answer_tokens", "prompt_tokens", "context", "answer_room"):
+                self.assertIn(key, e, path)
+            self.assertEqual(e["max_tokens_requested"], 20)
+            self.assertNotIn("messages", e["sampling"])           # the sampling fields, not the conversation
+        self.assertIn("reasoning_tokens", self.chat("/v1/chat/completions")["usage"]["completion_tokens_details"])
 
     def test_responses_effective(self):
         status, raw = self.request("/v1/responses", {"model": "x", "max_output_tokens": 20, "input": "hi"})
