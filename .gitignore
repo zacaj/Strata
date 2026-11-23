@@ -130,3 +130,15 @@ third_party/llama.cpp-gyro/CMakeLists.txt
 !/strata-*.json
 !/run-*.bat
 tmp/
+/traces-*/
+# local engine builds, vendored sources, runtime state
+/third_party/llama.cpp/
+/engine/strata.exe
+/engine/BUILD.json
+/engine/old-*/
+/engine-dsv41/
+/ds4-slots/
+/data/*.bin
+/prompt-logger/
+!/terminal/run-*.bat
+!/terminal/strata-*.json
