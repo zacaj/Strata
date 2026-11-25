@@ -96,7 +96,11 @@ def _packer():
     spec = importlib.util.spec_from_file_location("strata_dflash2_pack", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules.setdefault("strata_dflash2_pack", module)
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except ImportError as exc:                       # e.g. numpy missing: name it and the interpreter, instead of the generic "could not be prepared"
+        raise DraftingError(f"The packing tool needs a Python module that is missing ({exc}). This run used {sys.executable}; "
+                            "run it from Strata's own environment (./setup.sh, or terminal/.venv/bin/python) and try again.") from exc
     return module
 
 
