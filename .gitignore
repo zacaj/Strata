@@ -142,3 +142,6 @@ tmp/
 /prompt-logger/
 !/terminal/run-*.bat
 !/terminal/strata-*.json
+
+# rocprofv3 trace output
+.rocprofv3/
