@@ -64,7 +64,7 @@ class AutoAndTheBackends(unittest.TestCase):
         self.assertEqual(drafting.choice_of("dflash2", family="qwen", backend="sycl"), "dflash2")
         self.assertEqual(drafting.choice_of("dflash2", family="qwen", backend="cpu"), "mtp", "named, but the engine has none")
         self.assertEqual(drafting.choice_of("dflash2", family="coder", backend="cuda"), "dflash2", "#5240: the Coder runs DFlash2 when it is chosen by name")
-        self.assertEqual(drafting.choice_of("dflash2", family="swift", backend="cuda"), "mtp")
+        self.assertEqual(drafting.choice_of("dflash2", family="swift", backend="cuda"), "dflash2", "named DFlash2 runs on any model (warned)")
 
     def test_the_two_drafters_have_their_own_memory_figure(self):
         self.assertEqual((drafting.DRAFTER_GB["dflash2"], drafting.DRAFTER_GB["mtp"], drafting.DRAFTER_GB["off"]), (0.89, 1.08, 0.0))
@@ -157,8 +157,7 @@ class Decisions(unittest.TestCase):
         self.ready()
         for name in ("qwen3.6-35b-a3b-q4", "qwen3.8-flash-next-swift-iq2_xs", None):
             d = drafting.decide("dflash2", model_name=name, data_dir=self.data, backend="cuda")
-            self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_SUPPORTED), name)
-            self.assertFalse(drafting.needs_pack("dflash2", model_name=name, data_dir=self.data, backend="cuda"))
+            self.assertEqual((d.drafter, d.note), ("dflash2", ""), "named DFlash2 runs on any model (apply warns: UNTESTED)")
             self.assertEqual(drafting.decide("auto", model_name=name, data_dir=self.data, backend="cuda").note, "", "Auto never nags about a model DFlash2 is not for")
         for name in (GYRO, "qwen3.8-flash-next-q2_0", "qwen3.8-flash-next-iq3_xxs"):
             self.assertEqual(drafting.decide("dflash2", model_name=name, data_dir=self.data, backend="cuda").drafter, "dflash2", name)
@@ -343,9 +342,6 @@ class EngineArguments(unittest.TestCase):
         c = self.cfg(model_name="qwen3.8-flash-next-coder-iq3_xxs")
         d = self.apply(c)
         self.assertEqual((d.drafter, d.note, c["args"]), ("mtp", "", self.args))
-        c = self.cfg(model_name="qwen3.8-flash-next-swift-iq2_xs", drafting="dflash2", args=[*self.args, "--draft", "dflash2", "--draft-model", "/p"])   # (the Coder named: test_drafting_coder_named.py)
-        d = self.apply(c)
-        self.assertEqual((d.drafter, d.note, c["args"]), ("mtp", drafting.NOT_SUPPORTED, self.args))
 
     def test_intel_gets_its_own_confidence_not_the_cuda_slot_steps(self):
         self.layer()
@@ -526,9 +522,7 @@ class UnslothAndTheOtherFlashNextFiles(unittest.TestCase):
     def test_swift_coder_and_nvfp4_stay_on_the_mtp(self):
         for backend, archs in self.HARDWARE:
             for name in ("qwen3.8-flash-next-coder-iq1_m", "qwen3.8-flash-next-nvfp4-nvfp4", "swift-1.5-iq2_xs"):
-                for mode in (None, "auto", "dflash2"):
-                    if mode == "dflash2" and "-coder-" in name:
-                        continue                                    # #5240: the Coder named DFlash2 runs it (test_drafting_coder_named.py)
+                for mode in (None, "auto"):                         # (named DFlash2 runs on any model: test_drafting_coder_named.py)
                     with tempfile.TemporaryDirectory() as tmp:
                         cfg, data, mtp = self.run_config(name, tmp, mode)
                         original = list(cfg["args"])
@@ -536,8 +530,6 @@ class UnslothAndTheOtherFlashNextFiles(unittest.TestCase):
                         self.assertEqual(decision.drafter, "mtp", (backend, name, mode))
                         self.assertEqual(cfg["args"], original, "its own MTP arguments, untouched")
                         self.assertNotIn("--draft", cfg["args"])
-                        if mode == "dflash2":
-                            self.assertEqual(decision.note, drafting.NOT_SUPPORTED)
 
     def test_by_family_the_terminal_and_the_app_agree(self):
         for backend, _ in self.HARDWARE:
@@ -1026,13 +1018,11 @@ class TheAppAsksControl(unittest.TestCase):
             self.assertEqual(plan["gb"], 1.2)
             self.assertEqual(Path(plan["pack"]), drafting.pack_path(self.data), "the data folder comes from the run config's own arguments")
             self.cfg.write_text(json.dumps({"model_name": "qwen3.8-flash-next-swift-iq2_xs", "drafting": "dflash2", "args": ["--pack", str(self.data / "packs" / "c")]}))
-            other = self.plan()
-            self.assertFalse(other["needed"])
-            self.assertEqual(other["note"], drafting.NOT_SUPPORTED)
+            self.assertTrue(self.plan()["needed"], "named DFlash2 on any model fetches the pack")
 
     def test_a_model_that_is_not_installed_yet_is_asked_about_by_its_family(self):
         with serving_dflash2():
-            for family, needed in (("gyro", True), ("qwen", True), ("coder", True), ("swift", False)):       # (#5240: the Coder named)
+            for family, needed in (("gyro", True), ("qwen", True), ("coder", True), ("swift", True)):       # (named DFlash2: any model)
                 code, out, err = run_cli(["drafting", "plan", "--family", family, "--mode", "dflash2", "--data-dir", str(self.data), "--output", "json"])
                 self.assertEqual(code, 0, err)
                 self.assertEqual(json.loads(out)["needed"], needed, family)

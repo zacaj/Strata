@@ -26,7 +26,7 @@ def test_other_models_keep_their_decision():
     assert "--mtp" in cfg["args"]
     cfg = _cfg(drafting="dflash2")
     d = drafting.apply(cfg, backend="cuda", archs=["sm_86"])
-    assert (d.drafter, d.note) == ("mtp", drafting.NOT_SUPPORTED)
+    assert d.note != drafting.NOT_SUPPORTED                      # named DFlash2 is honoured on any model (here: no pack downloaded, same as a supported model)
 
 
 def test_the_terminal_plans_no_drafter_for_it():

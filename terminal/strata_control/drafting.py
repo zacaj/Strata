@@ -510,9 +510,24 @@ _NAMED_ONLY_NAME = re.compile(r"^qwen3\.8-flash-next-coder-[a-z0-9._-]+$", re.IG
 def supported_model(model_name: str | None = None, family: str | None = None, *, named: bool = False) -> bool:
     """DFlash2 is for Qwen3.8-Flash-Next only: by family when it is known (the Terminal), else by the run config's model name. ``named``: DFlash2 is the
     person's own choice, which also takes the Coder (NAMED_ONLY_FAMILIES, #5240)."""
+    if named:
+        return True                                   # the person's own choice runs on any model (warned when it was never measured there: untested_warning)
     if family is not None:
-        return family.lower() in SUPPORTED_FAMILIES or (named and family.lower() in NAMED_ONLY_FAMILIES)
-    return bool(model_name and (_SUPPORTED_NAME.match(str(model_name)) or (named and _NAMED_ONLY_NAME.match(str(model_name)))))
+        return family.lower() in SUPPORTED_FAMILIES
+    return bool(model_name and _SUPPORTED_NAME.match(str(model_name)))
+
+
+#: The warning (not a fallback) when DFlash2 was chosen by name for a model it was never measured on: it still runs.
+UNTESTED = "DFlash2 was chosen for a model it was not made for (Qwen3.8-Flash-Next); it runs anyway, acceptance may be low or the engine may not start"
+
+
+def untested_warning(model_name: str | None = None, family: str | None = None) -> str:
+    """UNTESTED for a model neither the drafter's own (supported_model) nor a measured by-name one (NAMED_ONLY_FAMILIES, the Coder); "" otherwise."""
+    if supported_model(model_name, family):
+        return ""
+    if family is not None:
+        return "" if family.lower() in NAMED_ONLY_FAMILIES else UNTESTED
+    return "" if model_name and _NAMED_ONLY_NAME.match(str(model_name)) else UNTESTED
 
 
 # --------------------------------------------------------------------------------------------------- the model file itself
@@ -869,6 +884,7 @@ class Decision:
     note: str = ""               # plain words when the choice could not be applied; "" otherwise
     flags: tuple[str, ...] = ()  # engine flags added
     vocab: str = ""              # log line (not shown to the person): which draft vocabulary file a DFlash2 start uses and why; "" for the other drafters
+    warning: str = ""            # the choice WAS applied but is untested on this model (UNTESTED); "" otherwise
 
 
 def normalize(value: Any) -> str:
@@ -1771,6 +1787,8 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
             i = flags.index("--spec")
             del flags[i:i + 2]
         cfg["args"] = base + flags
+        if decision.asked == "dflash2":
+            decision.warning = untested_warning(name, family)
     return decision
 
 

@@ -171,11 +171,11 @@ class ARenamedFileAtStart(unittest.TestCase):
             cfg["args"][cfg["args"].index("--native") + 1] = str(Path(tmp) / "gone.gguf")
             self.assertEqual(drafting.apply(cfg, data_dir=data, backend="cuda", archs=["sm_120"]).note, "")
 
-    def test_dflash2_named_on_another_model_says_it_cannot(self):
+    def test_dflash2_named_on_another_model_runs_with_a_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg, data = self.config(tmp, "my-copy", gguf_header(arch="llama"), "dflash2")
             decision = drafting.apply(cfg, data_dir=data, backend="cuda", archs=["sm_120"])
-            self.assertEqual((decision.drafter, decision.note), ("mtp", drafting.NOT_SUPPORTED))
+            self.assertEqual((decision.drafter, decision.note, decision.warning), ("dflash2", "", drafting.UNTESTED))
 
     def test_the_terminal_that_knows_the_family_does_not_read_the_file(self):
         with tempfile.TemporaryDirectory() as tmp:

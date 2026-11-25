@@ -12,8 +12,8 @@ export const DFLASH2_NAMED_FAMILIES = ['coder'];
 export function resolveDrafter(choice: string | null | undefined, family: string | null | undefined, served: boolean | null | undefined, split?: boolean | null): 'dflash2' | 'mtp' | 'off' {
   const c = String(choice ?? 'auto').toLowerCase();
   if (c === 'off' || c === 'mtp') return c;
-  // #5240: the Coder runs DFlash2 when it is chosen by name (strata_control/drafting.py NAMED_ONLY_FAMILIES); it has no Drafting dropdown, Auto stays the MTP there
-  if (!(served === true && (DRAFTING_FAMILIES.includes(String(family)) || (c === 'dflash2' && DFLASH2_NAMED_FAMILIES.includes(String(family)))))) return 'mtp';
+  // DFlash2 chosen by name runs on any family (strata_control/drafting.py supported_model named; Control warns where it was never measured); Auto stays the MTP outside DRAFTING_FAMILIES
+  if (!(served === true && (DRAFTING_FAMILIES.includes(String(family)) || c === 'dflash2'))) return 'mtp';
   // `split`: Control's plan says the all-cards split engine takes this start; it runs the MTP, so Auto is the MTP there (a DFlash2 the person chose stays)
   return split === true && c !== 'dflash2' ? 'mtp' : 'dflash2';
 }

@@ -1,5 +1,5 @@
 """#5240: DFlash2 on the Coder is an explicit opt-in. A DFlash2 chosen by name on the Coder starts DFlash2 with the stock pack (the Coder has no tuned pack) and no MTP
-layer; Auto (and no choice) keeps the MTP on the Coder; Swift and NVFP4 stay refused (the MTP, with the NOT_SUPPORTED line); setup fetches the stock pack only for the
+layer; Auto (and no choice) keeps the MTP on the Coder; DFlash2 named on any other model (Swift, NVFP4...) runs too, with the UNTESTED warning; setup fetches the stock pack only for the
 named choice. The app's copies (resolveDrafter) are checked against the same rule by app/host/tests/policy-generated.test.mjs."""
 
 from __future__ import annotations
@@ -36,21 +36,29 @@ class CoderNamed(unittest.TestCase):
         self.assertEqual(drafting.choice_of("auto", family="coder", backend="cuda"), "mtp")
         self.assertEqual(drafting.choice_of("auto", model_name=CODER, backend="cuda"), "mtp")
 
-    def test_swift_and_nvfp4_stay_refused(self):
+    def test_named_dflash2_runs_on_any_model_with_a_warning(self):
         for name in ("qwen3.8-flash-next-nvfp4-nvfp4", "swift-1.5-iq2_xs", "qwen3.8-flash-next-swift-iq2_xs"):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 cfg, data, _mtp = self.run_config(name, tmp, "dflash2")
                 d = drafting.apply(cfg, data_dir=data, backend="cuda", archs=["sm_89"])
-                self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_SUPPORTED))
+                self.assertEqual((d.drafter, d.note, d.warning), ("dflash2", "", drafting.UNTESTED))
+                self.assertIn("--draft", cfg["args"])
         for family in ("swift", "nvfp4", "qwen36"):
-            self.assertEqual(drafting.choice_of("dflash2", family=family, backend="cuda"), "mtp", family)
+            self.assertEqual(drafting.choice_of("dflash2", family=family, backend="cuda"), "dflash2", family)
+            self.assertEqual(drafting.choice_of("auto", family=family, backend="cuda"), "mtp", family)
+
+    def test_no_warning_on_measured_models(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, data, _mtp = self.run_config(CODER, tmp, "dflash2")
+            self.assertEqual(drafting.apply(cfg, data_dir=data, backend="cuda", archs=["sm_89"]).warning, "")
+        self.assertEqual(drafting.untested_warning(None, "gyro"), "")
+        self.assertEqual(drafting.untested_warning("swift-1.5-iq3_xxs"), drafting.UNTESTED)
 
     def test_the_named_rule(self):
         self.assertFalse(drafting.supported_model(CODER))
-        self.assertTrue(drafting.supported_model(CODER, named=True))
-        self.assertTrue(drafting.supported_model(None, "coder", named=True))
-        self.assertFalse(drafting.supported_model(None, "swift", named=True))
-        self.assertFalse(drafting.supported_model("qwen3.8-flash-next-coder", named=True), "the family name alone is not a set setup writes")
+        self.assertFalse(drafting.supported_model(None, "swift"))
+        for name, family in ((CODER, None), (None, "coder"), (None, "swift"), ("swift-1.5-iq3_xxs", None)):
+            self.assertTrue(drafting.supported_model(name, family, named=True), (name, family))
         self.assertEqual(drafting.NAMED_ONLY_FAMILIES, ("coder",))
 
     def test_setup_is_told_to_fetch_the_stock_pack_only_for_the_named_choice(self):

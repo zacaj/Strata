@@ -3576,6 +3576,8 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
             print(f"[strata] {drafting.SLOT_DRAFTS_LINE}", flush=True)
         elif decision.flags:
             print(f"[strata] drafting: DFlash2 alone ({' '.join(decision.flags[:2])}, --draft-conf {args[args.index('--draft-conf') + 1] if '--draft-conf' in args else '-'})", flush=True)
+        if decision.warning:
+            print(f"[strata] warning: {decision.warning}", flush=True)
         if decision.vocab:                                   # log only (a support log shows which draft vocabulary was used and why)
             print(f"[strata] drafting: {decision.vocab}", flush=True)
     # A card that is short of VRAM for this start (a single request on a small card, or "parallel" 2 or more, every request slot a session of its own) gets work moved off
