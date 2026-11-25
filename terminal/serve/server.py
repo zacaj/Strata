@@ -8849,6 +8849,17 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                               "prefill_gpu": int(pair[0]), "decode_gpu": int(pair[1])}
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+    if a.port is None:                                  # same order as setup.py's launcher: --port, the config's "port", default_port()
+        try:
+            a.port = int(cfg.get("port") or 0) or None
+        except (TypeError, ValueError):
+            a.port = None
+        if a.port is None:
+            try:
+                import setup as _setup
+                a.port = _setup.default_port()
+            except Exception:
+                a.port = 8080
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     supplied_args = argv if argv is not None else sys.argv[1:]
     if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or \

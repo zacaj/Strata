@@ -7185,6 +7185,18 @@ def load_settings() -> dict:
         return {}
 
 
+def default_port() -> int:
+    """The port a new install / start uses when neither --port nor the model's config gives one: $STRATA_PORT, then
+    "default_port" in settings.json, then 8080."""
+    for v in (os.environ.get("STRATA_PORT"), load_settings().get("default_port")):
+        try:
+            if v and 0 < int(v) < 65536:
+                return int(v)
+        except (TypeError, ValueError):
+            pass
+    return 8080
+
+
 def save_settings(s: dict) -> None:
     if s.get("data_dir") and s.get("data_dir") != load_settings().get("data_dir"):
         s = {**s, "data_dir_at": time.time()}           # when the models folder was chosen: the app and the Terminal keep the newer choice
@@ -8433,7 +8445,7 @@ def settings_summary(cfg: dict, port=None) -> str:
         if val is not None and ("/" in val or "\\" in val or val.lower().endswith((".gguf", ".bin"))):
             continue                                   # a path: --native, --mtp, --profile ...
         out.append(flag if val is None else f"{flag} {val}")
-    srv = [f"{cfg.get('host', '127.0.0.1')}:{port or cfg.get('port', 8080)}"]
+    srv = [f"{cfg.get('host', '127.0.0.1')}:{port or cfg.get('port') or default_port()}"]
     if cfg.get("api_key"):
         srv.append("api key set")
     if cfg.get("open_browser") is False:               # #609
@@ -8489,7 +8501,7 @@ def _start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open
         from strata_control import drafting
         refresh_dflash2_vocab(drafting.data_dir_of(cfg["args"]), cfg.get("draft_vocab", "cjk"))
     cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
-           "--port", str(port or cfg.get("port", 8080))]
+           "--port", str(port or cfg.get("port") or default_port())]
     if cfg.get("backend") == "hip":                    # AMD, numbered as HIP numbers them (setup's KFD order)
         if WIN and not component:
             hip_runtime_beside_exe(Path(cfg["exe"]).parent)   # #468 #461: also fixes a 0.1.34 install
@@ -9260,8 +9272,8 @@ def intel_control_setup(a) -> int:
         multi = sel_cards if len(sel_cards) > 1 else []
         a.backend = "sycl"
         if family in HY4_FAMILIES:
-            return install_hy4_flash(a, family, main_gpu, False, [], None, multi, a.port or 8080, ram_gb(), None)
-        return install_inkling2(a, family, main_gpu, False, [], None, multi, a.port or 8080, ram_gb(), None)
+            return install_hy4_flash(a, family, main_gpu, False, [], None, multi, a.port or default_port(), ram_gb(), None)
+        return install_inkling2(a, family, main_gpu, False, [], None, multi, a.port or default_port(), ram_gb(), None)
     if family not in FAMILIES or not intel_app.can_set_up(family, FAMILIES[family]):
         fail(f"cannot set up {family} for an Intel Arc card", "choose a Qwen3.8-Flash-Next, Swift, Coder, Gyro or Unsloth size")
     fam, model = FAMILIES[family], a.model
@@ -11066,7 +11078,7 @@ def mac_control_setup(a) -> int:
         mac_experts_file(shards[0])                    # a small Mac: its misses are many; a big Mac's arena holds most experts
 
     step(7, "writing the run settings")
-    port = a.port or 8080
+    port = a.port or default_port()
     profile = ROOT / "data" / "expert-profile.bin"
     neutral = getattr(__import__("strata_control.setup_config", fromlist=["x"]), "neutral_profile_if_other_shape", None)       # (f-0213-p8merge: F4, the owner's line)
     if neutral is not None and fam.get("feed") and shards:       # a feed model of another shape than the shipped profile's: a neutral profile for the file's layers x experts
@@ -11125,7 +11137,7 @@ def mac_hy4_setup(a) -> int:
     if problems:
         fail(problems[0])
     gpu = {"index": 0, "name": info["chip"], "vendor": "apple", "vram_gb": 0.0, "unified_gb": ram, "uma": True, "count": 1}
-    return install_hy4_flash(a, a.family or hy4_family.FAMILY, gpu, False, False, None, False, a.port or 8080, ram, None)
+    return install_hy4_flash(a, a.family or hy4_family.FAMILY, gpu, False, False, None, False, a.port or default_port(), ram, None)
 
 
 def mac_inkling_setup(a) -> int:
@@ -11149,7 +11161,7 @@ def mac_inkling_setup(a) -> int:
     if problems:
         fail(problems[0])
     gpu = {"index": 0, "name": info["chip"], "vendor": "apple", "vram_gb": 0.0, "unified_gb": ram, "uma": True, "count": 1}
-    return install_inkling2(a, a.family or inkling_family.FAMILY, gpu, False, False, None, False, a.port or 8080, ram, None)
+    return install_inkling2(a, a.family or inkling_family.FAMILY, gpu, False, False, None, False, a.port or default_port(), ram, None)
 
 
 def main() -> int:
@@ -11224,7 +11236,7 @@ def main() -> int:
     ap.add_argument("--experimental-speed-projection", metavar="on|off|GGUF",
                     help="EXPERIMENTAL, off by default: the control vector in data/experimental-speed-projection "
                          "(or another GGUF) as a projection on layers 4-44; see docs/DETAILS.md")
-    ap.add_argument("--port", type=int, help="the server's port (default: the one the install was set up with, 8080 for a new one)")
+    ap.add_argument("--port", type=int, help="the server's port (default: the one the install was set up with, $STRATA_PORT or settings.json \"default_port\", else 8080, for a new one)")
     ap.add_argument("--gpu", help="one GPU, numbered as nvidia-smi numbers them (AMD: as setup lists them) (default: asked when several can be "
                                   "used; with --setup it is saved, when starting it is for that start only)")
     ap.add_argument("--gpus", help="several GPUs sharing one model, as nvidia-smi numbers them (AMD: as setup lists "
@@ -11462,7 +11474,7 @@ def main() -> int:
     # on the first one alone unless given with --setup), --gpu N runs this start on one card; neither: the saved
     # choice, and asked once when the PC has cards that could share the model
     run_gpu = start_gpus(a.gpus) or a.gpu
-    port = a.port or 8080                              # a new install's port (issue #32: --port for an existing one)
+    port = a.port or default_port()                              # a new install's port (issue #32: --port for an existing one)
     if a.calibrate and (a.setup or a.check or not have):    # #2036: said, not dropped
         why = ("--setup" if a.setup else "--check" if a.check else "no model is installed yet")
         warn(f"--calibrate does nothing with {why}: it tunes a model that is already installed. Run setup first, "
