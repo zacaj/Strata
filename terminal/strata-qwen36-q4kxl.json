@@ -1,5 +1,5 @@
 {
-  "exe": "C:\\programs\\Strata\\build\\strata.exe",
+  "exe": "component:strata-engine",
   "args": [
     "--native",
     "C:\\models\\a3b\\Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP-unsloth.gguf",
@@ -19,7 +19,7 @@
     "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.0\\bin",
     "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.0\\bin\\x64"
   ],
-  "port": 8080,
+  "port": 3008,
   "gpu": 0,
   "gpus_asked": true
 }

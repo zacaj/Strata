@@ -1,12 +1,12 @@
 {
-  "exe": "C:\\programs\\Strata\\build\\strata.exe",
+  "exe": "component:strata-engine",
   "args": [
     "--pack",
-    "C:\\programs\\Strata-data\\packs\\swift-gyro-m",
+    "/var/mnt/S980-A/export/Strata/data/packs/swift-gyro-m",
     "--native",
-    "C:\\models\\gyro\\Swift-Qwen3.8-Flash-Next-Gyro-M-TQ2_0-00001-of-00003.gguf",
+    "/var/mnt/S980-A/export/models/gyro/Swift-Qwen3.8-Flash-Next-Gyro-M-TQ2_0-00001-of-00003.gguf",
     "--expert-profile",
-    "C:\\programs\\Strata\\terminal\\data\\expert-profile.bin",
+    "/var/home/zacaj/bin/Strata/terminal/data/expert-profile.bin",
     "--expert-cache",
     "auto",
     "--prefill",
@@ -14,13 +14,13 @@
     "--spec",
     "4",
     "--mtp",
-    "C:\\programs\\Strata-data\\mtp\\rt",
+    "/var/mnt/S980-A/export/Strata/data/mtp/rt",
     "--max-context",
     "300000",
     "--kv",
     "int8",
     "--kv-resident",
-    "32768",
+    "16384",
     "--spec-min-p",
     "0.5",
     "--adapt-every",
@@ -33,18 +33,20 @@
     "--conversation-cache-mib",
     "10000",
     "--conversation-cache-slots",
-    "4"
+    "4",
+    "--pool-workers",
+    "7"
   ],
-  "cwd": "C:\\programs\\Strata",
-  "tokenizer": "C:\\programs\\Strata-data\\packs\\swift-gyro-m\\tokenizer",
+  "cwd": "/var/home/zacaj/bin/Strata/terminal",
+  "tokenizer": "/var/mnt/S980-A/export/Strata/data/packs/swift-gyro-m/tokenizer",
   "model_name": "swift-gyro-m",
-  "log": "C:\\programs\\Strata\\terminal\\strata-swift-gyro-m.log",
+  "parallel": 2,
+  "drafting": "dflash2",
+  "log": "/var/home/zacaj/bin/Strata/terminal/strata-swift-gyro-m.log",
   "lib_dirs": [
-    "C:\\programs\\Strata\\terminal\\.venv\\Lib\\site-packages\\nvidia\\cu13\\bin\\x86_64"
+    "/var/home/zacaj/opt/rocm/lib"
   ],
-  "port": 8080,
-  "gpu": 0,
-  "gpus_asked": true,
+  "port": 3008,
   "api_monitor": true,
   "reasoning_effort": "medium",
   "sampling": {
@@ -56,11 +58,16 @@
   "fit_max_tokens": true,
   "vram_elastic": true,
   "vision": {
-    "exe": "C:\\programs\\Strata\\build-vision\\bin\\Release\\strata-vision.exe",
-    "mmproj": "C:\\programs\\Strata-data\\models\\mmproj-Qwen3.8-Flash-Next-BF16.gguf",
-    "model": "C:\\models\\gyro\\Swift-Qwen3.8-Flash-Next-Gyro-M-TQ2_0-00001-of-00003.gguf",
+    "exe": "/var/home/zacaj/bin/Strata/terminal/engine/strata-vision",
+    "mmproj": "/var/mnt/S980-A/export/Strata/data/models/mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf",
+    "model": "/var/mnt/S980-A/export/models/gyro/Swift-Qwen3.8-Flash-Next-Gyro-M-TQ2_0-00001-of-00003.gguf",
     "max_tokens": 300,
     "elastic": true,
-    "elastic_idle_s": 120
+    "elastic_idle_s": 120,
+    "gpu": false
+  },
+  "backend": "hip",
+  "env": {
+    "STRATA_HIPBLASLT_TUNING": "/var/home/zacaj/bin/Strata/terminal/tools/hip/gfx1100-hipblaslt-100500.txt"
   }
 }

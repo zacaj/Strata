@@ -1,5 +1,5 @@
 {
-  "exe": "C:\\programs\\Strata\\build\\strata.exe",
+  "exe": "component:strata-engine",
   "args": [
     "--pack",
     "C:\\programs\\Strata-data\\packs\\groot",
@@ -43,7 +43,7 @@
   "lib_dirs": [
     "C:\\programs\\Strata\\terminal\\.venv\\Lib\\site-packages\\nvidia\\cu13\\bin\\x86_64"
   ],
-  "port": 8080,
+  "port": 3008,
   "gpu": 0,
   "gpus_asked": true,
   "api_monitor": true,
@@ -54,5 +54,5 @@
     "top_k": 20
   },
   "host": "0.0.0.0",
-  "env": {}
+  "env": { }
 }

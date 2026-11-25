@@ -1,5 +1,5 @@
 {
-  "exe": "C:\\programs\\Strata\\build\\strata.exe",
+  "exe": "component:strata-engine",
   "args": [
     "--pack",
     "C:\\programs\\Strata-data\\packs\\coder-iq1_m",
@@ -22,7 +22,7 @@
     "--kv",
     "int8",
     "--kv-resident",
-    "32768",
+    "16384",
     "--spec-min-p",
     "0.5",
     "--adapt-every",
@@ -39,11 +39,13 @@
   "cwd": "C:\\programs\\Strata",
   "tokenizer": "C:\\programs\\Strata-data\\packs\\coder-iq1_m\\tokenizer",
   "model_name": "qwen3.8-flash-next-coder-iq1_m",
+  "parallel": 2,
+  "drafting": "dflash2",
   "log": "C:\\programs\\Strata\\terminal\\strata-coder-iq1_m.log",
   "lib_dirs": [
     "C:\\programs\\Strata\\terminal\\.venv\\Lib\\site-packages\\nvidia\\cu13\\bin\\x86_64"
   ],
-  "port": 8080,
+  "port": 3008,
   "gpu": 0,
   "gpus_asked": true,
   "api_monitor": true,

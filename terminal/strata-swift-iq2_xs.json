@@ -1,5 +1,5 @@
 {
-  "exe": "C:\\programs\\Strata\\terminal\\engine\\strata.exe",
+  "exe": "component:strata-engine",
   "args": [
     "--pack",
     "C:\\programs\\Strata-data\\packs\\swift-iq2_xs",
@@ -22,7 +22,7 @@
     "--kv",
     "int8",
     "--kv-resident",
-    "32768",
+    "16384",
     "--pcie-frac",
     "0.35",
     "--spec-min-p",
@@ -41,12 +41,14 @@
   "cwd": "C:\\programs\\Strata",
   "tokenizer": "C:\\programs\\Strata-data\\packs\\swift-iq2_xs\\tokenizer",
   "model_name": "swift-1.5-iq2_xs",
+  "parallel": 2,
+  "drafting": "dflash2",
   "log": "C:\\programs\\Strata\\terminal\\strata-swift-iq2_xs.log",
   "lib_dirs": [
     "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.0\\bin",
     "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.0\\bin\\x64"
   ],
-  "port": 8080,
+  "port": 3008,
   "gpu": 0,
   "gpus_asked": true,
   "api_monitor": true,

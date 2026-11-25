@@ -1,5 +1,5 @@
 {
-  "exe": "C:\\programs\\Strata\\build\\strata.exe",
+  "exe": "component:strata-engine",
   "args": [
     "--pack",
     "C:\\programs\\Strata-data\\packs\\unsloth-iq2_xs",
@@ -22,7 +22,7 @@
     "--kv",
     "int8",
     "--kv-resident",
-    "32768",
+    "16384",
     "--conversation-cache-mib",
     "5192",
     "--conversation-cache-slots",
@@ -45,11 +45,13 @@
   "cwd": "C:\\programs\\Strata",
   "tokenizer": "C:\\programs\\Strata-data\\packs\\unsloth-iq2_xs\\tokenizer",
   "model_name": "unsloth-iq2_xs",
+  "parallel": 2,
+  "drafting": "dflash2",
   "log": "C:\\programs\\Strata\\terminal\\strata-unsloth-iq2_xs.log",
   "lib_dirs": [
     "C:\\programs\\Strata\\terminal\\.venv\\Lib\\site-packages\\nvidia\\cu13\\bin\\x86_64"
   ],
-  "port": 8080,
+  "port": 3008,
   "gpu": 0,
   "gpus_asked": true,
   "api_monitor": true,
@@ -62,5 +64,5 @@
   "fit_max_tokens": true,
   "vram_elastic": true,
   "host": "0.0.0.0",
-  "env": {}
+  "env": { }
 }

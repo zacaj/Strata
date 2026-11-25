@@ -1,5 +1,5 @@
 {
-  "exe": "C:\\programs\\Strata\\build\\strata.exe",
+  "exe": "component:strata-engine",
   "args": [
     "--pack",
     "C:\\programs\\Strata-data\\packs\\darwin-180b-rsi-r3-gsq-rco-iq3_xxs",
@@ -22,7 +22,7 @@
     "--kv",
     "int8",
     "--kv-resident",
-    "32768",
+    "16384",
     "--spec-min-p",
     "0.5",
     "--adapt-every",
@@ -40,11 +40,13 @@
   "cwd": "C:\\programs\\Strata",
   "tokenizer": "C:\\programs\\Strata-data\\packs\\darwin-180b-rsi-r3-gsq-rco-iq3_xxs\\tokenizer",
   "model_name": "darwin-180b-rsi-r3-gsq-rco-iq3_xxs",
+  "parallel": 2,
+  "drafting": "dflash2",
   "log": "C:\\programs\\Strata\\terminal\\strata-darwin-180b-rsi-r3-gsq-rco-iq3_xxs.log",
   "lib_dirs": [
     "C:\\programs\\Strata\\terminal\\.venv\\Lib\\site-packages\\nvidia\\cu13\\bin\\x86_64"
   ],
-  "port": 8080,
+  "port": 3008,
   "gpu": 0,
   "gpus_asked": true,
   "api_monitor": true,
@@ -54,5 +56,9 @@
     "top_p": 0.95,
     "top_k": 20
   },
-  "host": "0.0.0.0"
+  "host": "0.0.0.0",
+  "env": {
+    "STRATA_HC_Q8_TC": "0",
+    "STRATA_HC_Q8_BF16TC": "0"
+  }
 }

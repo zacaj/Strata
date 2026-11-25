@@ -1,5 +1,5 @@
 {
-  "exe": "C:\\programs\\Strata\\build\\strata.exe",
+  "exe": "component:strata-engine",
   "args": [
     "--pack",
     "C:\\programs\\Strata-data\\packs\\swift-iq3_s",
@@ -24,7 +24,7 @@
     "--kv",
     "int8",
     "--kv-resident",
-    "32768",
+    "16384",
     "--conversation-cache-mib",
     "4096",
     "--conversation-cache-slots",
@@ -33,11 +33,13 @@
   "cwd": "C:\\programs\\Strata",
   "tokenizer": "C:\\programs\\Strata-data\\packs\\swift-iq3_s\\tokenizer",
   "model_name": "swift-1.5-iq3_s",
+  "parallel": 2,
+  "drafting": "dflash2",
   "log": "C:\\programs\\Strata\\terminal\\strata-swift-iq3_s.log",
   "lib_dirs": [
     "C:\\programs\\Strata\\terminal\\.venv\\Lib\\site-packages\\nvidia\\cu13\\bin\\x86_64"
   ],
-  "port": 8080,
+  "port": 3008,
   "gpu": 0,
   "gpus_asked": true,
   "api_monitor": true,

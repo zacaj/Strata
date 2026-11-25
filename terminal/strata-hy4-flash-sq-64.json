@@ -1,0 +1,50 @@
+{
+  "exe": "component:strata-hy4",
+  "args": [
+    "--native",
+    "/var/mnt/S980-A/export/Strata/data/models/hy4-flash/Hy4-Flash-SQ-64.strata",
+    "--engram",
+    "/var/mnt/S980-A/export/Strata/data/models/hy4-flash/Hy4-Flash-Engram-Q8.strata",
+    "--max-context",
+    "80000",
+    "--kv",
+    "q8",
+    "--session-reuse",
+    "1",
+    "--conversation-cache-dir",
+    "/dev/shm/strata-cc-hy4-flash-sq-64",
+    "--conversation-cache-gib",
+    "16",
+    "--vision",
+    "/var/mnt/S980-A/export/Strata/data/models/hy4-flash/Hy4-Flash-Vision.strata"
+  ],
+  "cwd": "/var/home/zacaj/bin/Strata/terminal",
+  "tokenizer": "/var/mnt/S980-A/export/Strata/data/packs/hy4-flash-sq-64/tokenizer",
+  "model_name": "hy4-flash-sq-64",
+  "arch": "hy4flash",
+  "log": "/var/home/zacaj/bin/Strata/terminal/strata-hy4-flash-sq-64.log",
+  "lib_dirs": [ ],
+  "port": 3008,
+  "drafting": "dfly2",
+  "backend": "hip",
+  "shape_title": "Tencent Hy4-Flash",
+  "args_written": [
+    "--native",
+    "/var/mnt/S980-A/export/Strata/data/models/hy4-flash/Hy4-Flash-SQ-64.strata",
+    "--engram",
+    "/var/mnt/S980-A/export/Strata/data/models/hy4-flash/Hy4-Flash-Engram-Q8.strata",
+    "--max-context",
+    "65536",
+    "--session-reuse",
+    "1",
+    "--vision",
+    "/var/mnt/S980-A/export/Strata/data/models/hy4-flash/Hy4-Flash-Vision.strata",
+    "--vram-experts-gb",
+    "12.68",
+    "--ram-experts-gb",
+    "43.36"
+  ],
+  "env": {
+    "HY4_CPU_THREADS": "13"
+  }
+}
