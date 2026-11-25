@@ -38,7 +38,8 @@ struct CcHeader {
     uint64_t swa_mask;      // bit l = layer l is a sliding-window layer
     uint64_t model_bytes;   // model file size (with model[]: model identity)
     char model[256];
-    uint8_t pad[512 - 8 - 4 - 4 * 5 - 4 * 2 - 8 - 8 - 256];
+    int32_t row_b;          // bytes per KV cache row (1152 FP16, 656 Q8); 0 in files from before this field = FP16
+    uint8_t pad[512 - 8 - 4 - 4 * 5 - 4 * 2 - 8 - 8 - 256 - 4];
 };
 static_assert(sizeof(CcHeader) == 512, "CcHeader is 512 bytes");
 
@@ -58,7 +59,7 @@ public:
     int min_tokens = 1024;
     int ck_pos = -1;  // prompt-end ring copy of the resident sequence
 
-    static constexpr size_t ROW_B = (size_t)576 * 2, IVG_B = (size_t)256 * 2, POOL_B = (size_t)128 * 2;
+    static constexpr size_t ROW_FP16_B = (size_t)MLA_ROW * 2, IVG_B = (size_t)256 * 2, POOL_B = (size_t)128 * 2;
 
     ConvCache() = default;
     ConvCache(const ConvCache&) = delete;
@@ -85,6 +86,7 @@ public:
         model_ = base.substr(0, 255);
         nl_ = r.c.n_layers;
         if (nl_ > 64) return false;
+        row_b_ = r.kv_q8 ? (size_t)MLA_ROW_Q8_BYTES : ROW_FP16_B;  // must match mla_cache_bytes(1, kv_q8)
         ring_ = r.ring;
         window_ = r.c.window;
         swa_mask_ = 0;
@@ -98,8 +100,8 @@ public:
         HCK(hipHostMalloc((void**)&ckbuf_, ring_set_bytes(), hipHostMallocDefault));
         scan();
         on = true;
-        fprintf(stderr, "[convcache] %s: %zu parked conversation(s), %.2f of %.1f GiB, ring %d, rewind up to %d tokens, parks sequences of %d+ tokens\n", dir.c_str(), ents_.size(),
-                total() / 1073741824.0, budget / 1073741824.0, ring_, rewind_limit(), min_tokens);
+        fprintf(stderr, "[convcache] %s: %zu parked conversation(s), %.2f of %.1f GiB, ring %d, kv %s, rewind up to %d tokens, parks sequences of %d+ tokens\n", dir.c_str(), ents_.size(),
+                total() / 1073741824.0, budget / 1073741824.0, ring_, r.kv_q8 ? "Q8" : "FP16", rewind_limit(), min_tokens);
         return true;
     }
 
@@ -174,6 +176,7 @@ public:
         h.n_layers = nl_;
         h.ring = ring_;
         h.window = window_;
+        h.row_b = (int32_t)row_b_;
         h.ntok = fwd;
         h.swa_mask = swa_mask_;
         h.model_bytes = model_bytes_;
@@ -203,7 +206,7 @@ public:
         if (ok && h.nring == 2) ok = wr(fd, ckbuf_, ring_set_bytes());
         for (int l = 0; ok && l < nl_; ++l) {
             if (swa(l)) continue;
-            ok = d2f(fd, r.kcache[l], (size_t)fwd * ROW_B) && d2f(fd, r.ivg[l], (size_t)fwd * IVG_B) && d2f(fd, r.pooled[l], (size_t)(fwd / 4 + 1) * POOL_B);
+            ok = d2f(fd, r.kcache[l], (size_t)fwd * row_b_) && d2f(fd, r.ivg[l], (size_t)fwd * IVG_B) && d2f(fd, r.pooled[l], (size_t)(fwd / 4 + 1) * POOL_B);
         }
         ok = close_fd(fd) && ok;
         std::error_code ec;
@@ -260,10 +263,10 @@ public:
                 rs += ring_b();
             }
         off += (uint64_t)h.nring * ring_set_bytes();
-        const size_t kvb = (size_t)h.ntok * ROW_B, ivb = (size_t)h.ntok * IVG_B, plb = (size_t)(h.ntok / 4 + 1) * POOL_B;
+        const size_t kvb = (size_t)h.ntok * row_b_, ivb = (size_t)h.ntok * IVG_B, plb = (size_t)(h.ntok / 4 + 1) * POOL_B;
         for (int l = 0; ok && l < nl_; ++l) {
             if (swa(l)) continue;
-            ok = f2d(fd, off, r.kcache[l], (size_t)s * ROW_B) && f2d(fd, off + kvb, r.ivg[l], (size_t)s * IVG_B) &&
+            ok = f2d(fd, off, r.kcache[l], (size_t)s * row_b_) && f2d(fd, off + kvb, r.ivg[l], (size_t)s * IVG_B) &&
                  f2d(fd, off + kvb + ivb, r.pooled[l], (size_t)(s / 4 + 1) * POOL_B);
             off += kvb + ivb + plb;
         }
@@ -288,6 +291,7 @@ private:
     std::string model_;
     uint64_t model_bytes_ = 0, swa_mask_ = 0;
     int nl_ = 0, ring_ = 0, window_ = 0, nswa_ = 0;
+    size_t row_b_ = ROW_FP16_B;
 
     static int popcnt64(uint64_t v) {
         int c = 0;
@@ -295,12 +299,12 @@ private:
         return c;
     }
     bool swa(int l) const { return (swa_mask_ >> l) & 1; }
-    size_t ring_b() const { return (size_t)ring_ * ROW_B; }
+    size_t ring_b() const { return (size_t)ring_ * row_b_; }
     size_t ring_set_bytes() const { return (size_t)nswa_ * ring_b(); }
     uint64_t file_bytes(const CcHeader& h) const {
         int nsp = h.n_layers - popcnt64(h.swa_mask);
         return sizeof(CcHeader) + (uint64_t)h.ntok * 4 + (uint64_t)h.nring * ring_set_bytes() +
-               (uint64_t)nsp * ((uint64_t)h.ntok * (ROW_B + IVG_B) + (uint64_t)(h.ntok / 4 + 1) * POOL_B);
+               (uint64_t)nsp * ((uint64_t)h.ntok * (row_b_ + IVG_B) + (uint64_t)(h.ntok / 4 + 1) * POOL_B);
     }
     uint64_t total() const {
         uint64_t t = 0;
@@ -432,7 +436,7 @@ private:
             bool ok = rd(fd, 0, &e.h, sizeof e.h);
             const CcHeader& h = e.h;
             ok = ok && memcmp(h.magic, "H4CC0001", 8) == 0 && h.hdr_bytes == sizeof(CcHeader) && h.n_layers == nl_ && h.ring == ring_ && h.window == window_ &&
-                 h.swa_mask == swa_mask_ && h.model_bytes == model_bytes_ && strncmp(h.model, model_.c_str(), sizeof h.model) == 0 && h.ntok > 0 && h.nring >= 1 && h.nring <= 2;
+                 h.swa_mask == swa_mask_ && (size_t)(h.row_b ? h.row_b : (int32_t)ROW_FP16_B) == row_b_ && h.model_bytes == model_bytes_ && strncmp(h.model, model_.c_str(), sizeof h.model) == 0 && h.ntok > 0 && h.nring >= 1 && h.nring <= 2;
             const auto fsz = std::filesystem::file_size(de.path(), ec);
             ok = ok && !ec && (uint64_t)fsz == file_bytes(h);
             if (ok) {
@@ -446,7 +450,7 @@ private:
             if (ok) {
                 ents_.push_back(std::move(e));
             } else {
-                fprintf(stderr, "[convcache] ignoring %s (another model, ring or a damaged file)\n", e.path.c_str());
+                fprintf(stderr, "[convcache] ignoring %s (another model, ring, KV precision or a damaged file)\n", e.path.c_str());
             }
         }
         evict();
