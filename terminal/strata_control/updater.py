@@ -24,6 +24,7 @@ Models and presets are never read, moved, deleted or downloaded here.
 
 from __future__ import annotations
 
+from strata_control import config_layers
 import contextlib
 import datetime as dt
 import json
@@ -856,7 +857,7 @@ def _config_component_id(source) -> str:
     cfg = source
     if not isinstance(cfg, dict):
         try:
-            cfg = json.loads(Path(source).read_text(encoding="utf-8-sig"))
+            cfg = config_layers.load(Path(source))
         except (OSError, ValueError, TypeError):
             return ec.COMPONENT_ID
     if not isinstance(cfg, dict):
@@ -1355,7 +1356,7 @@ def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Con
     from strata_control import profiles, runtime
     sandbox = Path(tempfile.mkdtemp(prefix="t-", dir=stage_root))
     try:
-        cfg = json.loads(source.read_text(encoding="utf-8-sig"))
+        cfg = config_layers.load(source)
         # paths setup wrote inside a Control folder that is gone (an AppImage's /tmp/.mount_<random>, a moved install): this Control's own files (QAGUI-LIN 0213)
         from strata_control import control_paths
         cfg = control_paths.repoint(cfg)
