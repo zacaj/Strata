@@ -672,5 +672,89 @@ class CalibrateQ36(unittest.TestCase):
         self.assertTrue(CAL.is_q36(["--mtp", "2"]))
 
 
+class FakeHy4(FakeEngine):
+    """strata-hy4: decode speed from HY4_CPU_THREADS, --draft and --chunk; prompt read speed from --chunk.  Refuses
+    every Flash-Next flag, as the real one does."""
+
+    def __init__(self, args, env, starts, speed, read):
+        for f in ("--pcie-frac", "--spec-min-p", "--pool-workers", "--adapt-every", "--threads"):
+            if f in args:
+                raise RuntimeError(f"ERR unknown flag {f}")
+        self.args = list(args)
+        self.threads = int((env or {}).get(CAL.HY4_THREADS) or 10)
+        self.draft = CAL.arg_value(args, "--draft") or "off"
+        self.chunk = CAL.arg_value(args, "--chunk") or "auto"
+        self.speed_f, self.read_f = speed, read
+        self.last, self.proc, self.info = {}, None, {}
+        starts.append((list(args), dict(env or {})))
+
+    def generate(self, ids, max_new, sampling, cancel):
+        for _ in range(max_new):
+            yield 1
+        rate = self.speed_f(self.threads, self.draft, self.chunk)
+        self.last = {"generated": max_new, "decode_ms": max_new / rate * 1000.0, "prompt_tokens": len(ids),
+                     "prompt_read": len(ids), "prompt_ms": len(ids) / self.read_f(self.chunk) * 1000.0}
+
+
+class CalibrateHy4(unittest.TestCase):
+    BASE = ["--native", "Hy4-Flash-SQ-64.strata", "--max-context", "65536", "--session-reuse", "1", "--draft", "dfly2"]
+
+    def run_hy4(self, speed, read, base=BASE, cpu_pool=True, drafter=True):
+        starts = []
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "engine.log"
+            log.write_text("an earlier run\n[cpuexp] 99 pool threads\n")
+
+            def start(a, env=None):            # the engine logs its plan and its pool, as the real one does
+                e = FakeHy4(a, env, starts, speed, read)
+                with open(log, "a") as f:
+                    f.write(f"[plan] ctx 65536 (init 16384, kv=fp16) chunk {4096 if e.chunk == 'auto' else e.chunk}: buffers\n")
+                    if cpu_pool:
+                        f.write(f"[cpuexp] {e.threads} pool threads (pinned, physical cores first)\n")
+                return e
+            with mock.patch.object(CAL.os, "cpu_count", return_value=20):
+                res = CAL.measure_hy4(base, [[1, 2, 3]] * 3, start, say=lambda *_: None,
+                                      long_prompt=lambda i, n: [1] * n, drafter=drafter, log=str(log))
+        return res, starts
+
+    def test_picks_threads_drafting_and_a_chunk(self):
+        # 13 threads decode fastest (10 is the engine's own); DFly2 beats off; chunk 2048 decodes a little faster and
+        # keeps most of the prompt speed, 1024 decodes fastest but reads at a third
+        speed = lambda t, dr, c: (40.0 - abs(t - 13) * 2) * (1.2 if dr == "dfly2" else 1.0) * \
+            {"auto": 1.0, "4096": 1.0, "2048": 1.06, "1024": 1.1}[c]
+        read = lambda c: {"auto": 900.0, "4096": 900.0, "2048": 800.0, "1024": 300.0}[c]
+        res, starts = self.run_hy4(speed, read)
+        self.assertEqual(res["env"], {CAL.HY4_THREADS: "13"})
+        self.assertEqual(res["settings"], {"--chunk": "2048"})
+        self.assertNotIn(("4096",), [(CAL.arg_value(a, "--chunk"),) for a, _ in starts])   # the planned chunk is not re-measured
+        # 13 / 15 / 7 against the engine's 10, then 10 and 13 once more (the confirmation)
+        self.assertEqual({e.get(CAL.HY4_THREADS) for _, e in starts[1:]} - {None}, {"10", "13", "15", "7"})
+        out = CAL.apply(self.BASE, res["settings"], "hy4flash")
+        self.assertEqual(CAL.arg_value(out, "--chunk"), "2048")
+        for flag in ("--spec-min-p", "--pcie-frac", "--pool-workers"):
+            self.assertNotIn(flag, out)                       # none of Flash-Next's flags are added
+        self.assertEqual(CAL.apply_env({CAL.HY4_THREADS: "10", "X": "1"}, res["env"]), {"X": "1", CAL.HY4_THREADS: "13"})
+
+    def test_drafting_off_when_it_loses(self):
+        res, _ = self.run_hy4(lambda t, dr, c: 30.0 if dr == "off" else 22.0, lambda c: 900.0)
+        self.assertEqual(res["settings"], {"--draft": "off"})
+        self.assertEqual(CAL.arg_value(CAL.apply(self.BASE, res["settings"], "hy4flash"), "--draft"), "off")
+
+    def test_no_gain_changes_nothing(self):
+        res, _ = self.run_hy4(lambda t, dr, c: 25.0, lambda c: 900.0)
+        self.assertEqual(res["settings"], {})
+        self.assertEqual(res["env"], {CAL.HY4_THREADS: "10"})     # the measured count is written either way
+        self.assertEqual(CAL.apply(self.BASE, res["settings"], "hy4flash"), self.BASE)
+
+    def test_no_cpu_pool_and_no_drafter(self):
+        base = [a for a in self.BASE if a not in ("--draft", "dfly2")]
+        res, starts = self.run_hy4(lambda t, dr, c: 25.0, lambda c: 900.0, base=base, cpu_pool=False, drafter=False)
+        self.assertEqual(res["env"], {})
+        self.assertTrue(all("--draft" not in a for a, _ in starts))
+
+    def test_chunk_auto_removes_the_flag(self):
+        self.assertEqual(CAL.apply(self.BASE + ["--chunk", "1024"], {"--chunk": "auto"}, "hy4flash"), self.BASE)
+
+
 if __name__ == "__main__":
     unittest.main()

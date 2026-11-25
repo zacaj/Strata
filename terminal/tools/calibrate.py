@@ -28,6 +28,9 @@ The first two and the prompt chunks are measured through one engine (per-request
 count, the adaptive tier and the shared-expert stream need a restart per value.  Those are decode speed: the prompt
 path streams every expert whatever they say.
 
+Qwen3.6-A3B, Inkling-2 and Hy4-Flash (strata-hy4: CPU threads via HY4_CPU_THREADS, DFly2 on/off, the prompt chunk)
+have engines of their own with none of these settings; each has its own section below (measure_q36 / _inkling / _hy4).
+
 A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
 adaptive expert tier and the OS make single measurements noisy by a few percent.
 
@@ -262,12 +265,25 @@ def run(cfg: dict, say=print, start_engine=None, *, progress=None, cancel_event=
         toks = [None] * len(vocab)
         for t, i in vocab.items():
             toks[i] = t
+        try:                                   # the pack's pre-tokenizer and special ids, as the server reads them
+            tcfg = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            tcfg = {}
         tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
-                           json.loads((tpath / "token_type.json").read_text()))
+                           json.loads((tpath / "token_type.json").read_text()),
+                           tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None)
         if is_inkling(cfg.get("arch")):
             ink_ids, ink_make = ink_prompts(tpath, tok)
             return measure_inkling(engine_args(cfg), ink_ids, start_engine, say, ink_make,
                                    progress=progress, cancel_event=cancel_event)
+        if is_hy4(cfg):
+            from serve import hy4_kind
+            args = engine_args(cfg)
+            drafter = arg_value(args, "--draft") not in (None, "off") or \
+                (hy4_kind.probe(cfg.get("exe"), args, cfg) or {}).get("drafter") == "dfly2"
+            hy4_ids, hy4_make = ink_prompts(tpath, tok)     # the pack's own chat template, as for Inkling
+            return measure_hy4(args, hy4_ids, start_engine, say, host_worker_extras(), hy4_make,
+                               drafter=drafter, log=cfg.get("log"), progress=progress, cancel_event=cancel_event)
         ids_list = [chat_ids(tok, p) for p in PROMPTS]
         if cfg.get("arch") == "qwen35moe":
             return measure_q36(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(), doc_prompt(tok),
@@ -739,6 +755,199 @@ def measure_inkling(base_args: list[str], ids_list, start_engine, say=print, lon
     return {"settings": settings, "env": {}, "report": report}
 
 
+# ---- Hy4-Flash (arch hy4flash, the strata-hy4 program, serve/hy4_kind.py): another engine with none of the Flash-Next
+# settings - it refuses a flag it does not know, so nothing from DEFAULTS may reach it.  Three settings are worth measuring,
+# each with a restart:
+#   HY4_CPU_THREADS  the CPU expert pool (an environment variable: the engine has no thread flag).  Its own count is half
+#                    the logical CPUs (minus some on big ones), which assumes SMT: on a Core Ultra 265K (20 cores, no SMT)
+#                    that is 10, and 13 decoded ~2x faster than 10 while 18 lost a third and 20 half.
+#   --draft          DFly2 drafting (dfly2) against none (off), by decode speed.
+#   --chunk          the prompt chunk (0 / absent: the engine plans it from the card).  A smaller one leaves VRAM to the
+#                    expert slots (decode), a bigger one reads prompts faster, so both are measured, as for the A3B.
+# Not measured: the PCIe/CPU miss split (the engine measures it itself at every start; fixed shares measured slower),
+# --spec-k and the VRAM expert cache's swaps/decay (inside the noise between starts, ~10% on the 265K).  That noise is
+# also why a stage's winner is measured again against the stage's current value (another start each) before it is kept.
+HY4_THREADS = "HY4_CPU_THREADS"
+HY4_CHUNKS = ("1024", "2048", "4096")
+HY4_MAX_NEW = 384                  # DFly2 backs off and probes over a reply: 128-token answers end before it settles
+
+
+def is_hy4(cfg: dict | None) -> bool:
+    try:
+        from serve import hy4_kind
+        return hy4_kind.is_hy4(cfg)
+    except ImportError:
+        return isinstance(cfg, dict) and cfg.get("arch") == "hy4flash"
+
+
+def log_find(log: str | None, since: int, pattern: str) -> str | None:
+    """The first group of the last match of `pattern` in the engine log after byte `since`; None without one."""
+    if not log:
+        return None
+    try:
+        with open(log, "rb") as f:
+            f.seek(since)
+            found = re.findall(pattern, f.read().decode("utf-8", "replace"))
+    except OSError:
+        return None
+    return found[-1] if found else None
+
+
+def hy4_threads(default: int, extra=()) -> list[int]:
+    """The thread counts to try: the current count, a third and a half more (the engine's own count is low on a CPU
+    without SMT), two thirds of it, plus the hybrid-CPU extras; at most 5, none above the PC's CPUs."""
+    top = os.cpu_count() or default
+    out = [default]
+    for w in (round(default * 4 / 3), round(default * 1.5), round(default * 2 / 3), *extra):
+        if 2 <= w <= top and w not in out:
+            out.append(w)
+    return out[:5]
+
+
+def measure_hy4(base_args: list[str], ids_list, start_engine, say=print, extra_workers=(), long_prompt=None, *,
+                drafter: bool = True, log: str | None = None, progress=None, cancel_event=None) -> dict:
+    t0 = time.time()
+    report: dict = {}
+    settings: dict = {}
+    env_out: dict = {}
+    cur_args, cur_env = list(base_args), {}
+    reads = [0]
+
+    def try_value(args, env, what, with_read=False):
+        """A restart, two decode rates (and the prompt read speed); None when the engine does not start or dies."""
+        try:
+            since = os.path.getsize(log) if log and os.path.exists(log) else 0
+        except OSError:
+            since = 0
+        e = restart((lambda a: start_engine(a, dict(env))) if env else start_engine, args, what, say, report)
+        if e is None:
+            return None
+        try:
+            s = Session(e, ids_list, cancel_event)
+            s.warm_up(1)
+            out = {"rates": [s.rate(max_new=HY4_MAX_NEW), s.rate(max_new=HY4_MAX_NEW)]}
+            if with_read and long_prompt is not None:
+                out["read"] = read_rate(e, long_prompt, reads)
+            threads = log_find(log, since, r"\[cpuexp\] (\d+) pool threads")
+            chunk = log_find(log, since, r"\[plan\][^\n]*? chunk (\d+)")
+            if threads:
+                out["threads"] = int(threads)
+            if chunk:
+                out["chunk"] = int(chunk)
+            say(f"    {what}: {statistics.median(out['rates']):.1f} tok/s" +
+                (f", prompt read {out['read']:.0f} tok/s" if out.get("read") else ""))
+            return out
+        except CalibrationCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the engine died mid-measurement: this candidate loses (#1337)
+            say(f"    the engine died while measuring {what}: {first_line(exc)} - this candidate is dropped")
+            report.setdefault("failed_starts", {})[what] = first_line(exc)
+            return None
+        finally:
+            close(e)
+
+    def stage(name, values, cur, label, setting, with_read=False, cur_result=None, choose=None):
+        """Every value against the current one (a restart each; the current one's measurement is reused when given),
+        then the winner and the current value once more each.  `setting(v)` gives (args, env) for a value; `choose(got)`
+        picks from the measurements (default: decode speed).  Returns (value kept, its measurement)."""
+        choose = choose or (lambda g: pick({k: r["rates"] for k, r in g.items()}, cur))
+        got = {}
+        total = len(values)
+        _progress(progress, name, 0, total)
+        for i, v in enumerate(values, 1):
+            _check_cancel(cancel_event)
+            if v == cur and cur_result is not None:
+                got[v] = cur_result
+                say(f"    {label(v)}: {statistics.median(cur_result['rates']):.1f} tok/s (as measured)")
+            else:
+                say(f"  Measuring {label(v)} (restarts the engine) ...")
+                r = try_value(*setting(v), label(v), with_read)
+                if r:
+                    got[v] = r
+            _progress(progress, name, i, total)
+        best = choose(got) if cur in got else cur
+        if best != cur:                         # a second start of both: one start can be ~10% off
+            for v in (cur, best):
+                _check_cancel(cancel_event)
+                say(f"  Measuring {label(v)} again (restarts the engine) ...")
+                r = try_value(*setting(v), label(v) + " (again)", with_read)
+                if r is None:
+                    continue
+                got[v] = {**got[v], "rates": got[v]["rates"] + r["rates"]}
+                if r.get("read") and got[v].get("read"):
+                    got[v]["read"] = (got[v]["read"] + r["read"]) / 2
+            best = choose(got)
+        report[name] = {str(k): v for k, v in got.items()}
+        return best, got.get(best)
+
+    # 0. the config as it is: the baseline, and the engine's own thread count and prompt chunk from its log
+    _progress(progress, "loading", 0, 1)
+    say("  Loading the model for the measurements ...")
+    res = try_value(cur_args, cur_env, "the config's settings", with_read=True)
+    _progress(progress, "loading", 1, 1)
+    if res is None:
+        raise RuntimeError("the engine did not start with the config's settings: " +
+                           str((report.get("failed_starts") or {}).get("the config's settings", "")))
+    # 1. the CPU threads (no CPU pool, every expert in VRAM: nothing to tune)
+    d_threads = res.get("threads")
+    if d_threads:
+        report["default_threads"] = d_threads
+        threads, r = stage("cpu_workers", hy4_threads(d_threads, extra_workers), d_threads,
+                           lambda v: f"{v} CPU threads", lambda v: (cur_args, {**cur_env, HY4_THREADS: str(v)}),
+                           with_read=True, cur_result=res)
+        cur_env[HY4_THREADS] = env_out[HY4_THREADS] = str(threads)     # always written: a calibration's value stays
+        res = r or res
+    else:
+        _progress(progress, "cpu_workers", 1, 1)
+        say("  No CPU expert pool in the engine's log (every expert in VRAM?): not tuning the CPU threads.")
+    # 2. DFly2 drafting against none
+    draft_cur = arg_value(cur_args, "--draft") or "off"
+    if drafter or draft_cur != "off":
+        vals = list(dict.fromkeys([draft_cur, "dfly2", "off"]))
+        draft, r = stage("drafting", vals, draft_cur, lambda v: f"drafting {v}",
+                         lambda v: (with_arg(cur_args, "--draft", v), cur_env), with_read=True, cur_result=res)
+        if draft != draft_cur:
+            cur_args = with_arg(cur_args, "--draft", draft)
+            settings["--draft"] = draft
+        res = r or res
+    else:
+        _progress(progress, "drafting", 1, 1)
+        say("  This engine has no drafter (DFly2): not measuring drafting.")
+    # 3. the prompt chunk: the fastest decode among the chunks that keep Q36_MIN_READ of the current prompt read speed;
+    # with no decode winner, the fastest prompt read among those within MIN_GAIN of the current decode speed
+    chunk_cur = arg_value(cur_args, "--chunk") or "auto"
+    planned = str(res.get("chunk") or "") if chunk_cur == "auto" else ""
+    chunk_vals = [chunk_cur] + (["auto"] if chunk_cur != "auto" else []) + \
+        [c for c in HY4_CHUNKS if c not in (chunk_cur, planned)]
+
+    def choose_chunk(got):
+        base = got[chunk_cur]
+        floor = Q36_MIN_READ * base.get("read", 0.0)
+        ok = {k: r for k, r in got.items() if k == chunk_cur or r.get("read", 0.0) >= floor}
+        for k in got.keys() - ok.keys():
+            say(f"    prompt chunk {k} reads prompts at {got[k].get('read', 0.0):.0f} against {base.get('read', 0.0):.0f}"
+                " tok/s: not considered")
+        best = pick({k: r["rates"] for k, r in ok.items()}, chunk_cur)
+        if best != chunk_cur or not base.get("read"):
+            return best
+        dec0 = statistics.median(base["rates"])
+        near = {k: r for k, r in ok.items() if r.get("read") and statistics.median(r["rates"]) >= dec0 * (1.0 - MIN_GAIN)}
+        fast = max(near, key=lambda k: near[k]["read"])
+        return fast if near[fast]["read"] > base["read"] * (1.0 + MIN_GAIN) else chunk_cur
+
+    chunk, r = stage("prompt_chunk", chunk_vals, chunk_cur,
+                     lambda v: f"prompt chunk {v}" + (f" (the engine's plan: {planned})" if v == "auto" and planned else ""),
+                     lambda v: (with_arg(cur_args, "--chunk", None if v == "auto" else v), cur_env),
+                     with_read=True, cur_result=res, choose=choose_chunk)
+    if chunk != chunk_cur:
+        settings["--chunk"] = chunk
+        res = r or res
+    report["seconds"] = round(time.time() - t0)
+    report["tok_s"] = round(statistics.median(res["rates"]), 1) if res else None
+    _check_cancel(cancel_event)
+    return {"settings": settings, "env": env_out, "report": report}
+
+
 def first_line(exc: Exception) -> str:
     return str(exc).strip().splitlines()[0][:300] if str(exc).strip() else type(exc).__name__
 
@@ -809,6 +1018,10 @@ def apply(args: list[str], settings: dict, arch: str | None = None) -> list[str]
     values never linger.  A Qwen3.6-A3B config (--mtp N) is tuned against its own current values, so only the settings
     the calibration changed are written and nothing else is added or reset."""
     out = list(args)
+    if arch == "hy4flash":                            # Hy4-Flash: only what was measured; chunk "auto" is no flag
+        for flag, v in settings.items():
+            out = with_arg(out, flag, None if (flag == "--chunk" and v == "auto") else v)
+        return out
     if is_q36(out, settings) or is_inkling(arch):     # Inkling: likewise, only what was measured (no Flash-Next flags)
         for flag, v in settings.items():
             out = with_arg(out, flag, v)
@@ -818,7 +1031,7 @@ def apply(args: list[str], settings: dict, arch: str | None = None) -> list[str]
     return out
 
 
-ENV_KEYS = (SH_STREAM,)
+ENV_KEYS = (SH_STREAM, HY4_THREADS)
 
 
 def apply_env(env: dict | None, calibrated: dict | None) -> dict:
