@@ -5670,6 +5670,7 @@ class Service:
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
         nf_retried = False                              # #879: the request was sent again after non-finite logits
         timings, before = None, None                    # this request's timings; the engine's `last` before it
+        experts = None                                  # this request's expert cache figures (strata_experts)
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
@@ -6115,6 +6116,15 @@ class Service:
                             routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
+                            # the same figures for the client (the final chunk's strata_experts): None from an
+                            # engine without an expert cache, so a dense model's answer carries no such field
+                            experts = {k: v for k, v in {
+                                "hit_rate": hit_rate, "pcie_share": pcie_share,
+                                "hits": last.get("hits"), "lookups": last.get("lookups"),
+                                "offloaded": last.get("offloaded"), "ram_blobs": last.get("ram_blobs"),
+                                "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
+                                "experts_streamed": last.get("experts_streamed")}.items() if v is not None} or None \
+                                if last.get("lookups") else None
                             seen = 0 if admission_rejected else prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read; #3040
                             self.history.append({
                                 "id": request_id,
@@ -6249,7 +6259,7 @@ class Service:
             for ev in hold.push([Event("content", stops.flush())]):
                 yield "event", ev
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                "timings": timings, "reasoning_tokens": thinking_n,
+                "timings": timings, "experts": experts, "reasoning_tokens": thinking_n,
                 "reasoning_recoveries": recovery_count,
                 # what took effect, for a caller that records it: the sampling after the merge with the defaults and
                 # after any recovery override, the output cap, and the thinking budget actually armed
@@ -6534,6 +6544,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                              "completion_tokens_details": {"reasoning_tokens": x.get("reasoning_tokens") or 0}}
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
+            if x.get("experts"):
+                last["strata_experts"] = x["experts"]   # the expert cache: VRAM hit rate, PCIe share, RAM/file reads
             if x.get("rejected_tool_calls"):
                 last["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796: only when a call was refused as undeclared
             if x.get("unread_tool_markup"):
@@ -6669,6 +6681,10 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             delta_event = {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")},
                            "usage": {"input_tokens": 1, "cache_creation_input_tokens": read_now - 1,
                                      "cache_read_input_tokens": reused, "output_tokens": x["completion_tokens"]}}
+            if x.get("timings"):
+                delta_event["timings"] = x["timings"]   # llama.cpp's field, as /v1/chat/completions and /v1/responses send it
+            if x.get("experts"):
+                delta_event["strata_experts"] = x["experts"]
             if x.get("rejected_tool_calls"):
                 delta_event["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796
             if x.get("unread_tool_markup"):
@@ -7826,12 +7842,12 @@ def make_handler(svc: Service):
                             kind = item["type"]
                             content = item["delta"] if kind == "response.output_text.delta" else ""
                             reasoning = item["delta"] if kind == "response.reasoning_text.delta" else ""
-                            usage, timings = (item.get("response") or {}).get("usage"), None
+                            usage, timings = (item.get("response") or {}).get("usage"), item.get("timings")
                         else:
                             _, event = item
                             delta = event.get("delta", {})
                             content, reasoning = delta.get("text", ""), delta.get("thinking", "")
-                            usage, timings = event.get("usage"), None
+                            usage, timings = event.get("usage"), event.get("timings")
                         with svc.status_lock:
                             for name, value in (("output", content), ("reasoning", reasoning)):
                                 if value:
@@ -8701,7 +8717,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     ap.add_argument("--script", action="append",
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
-    ap.add_argument("--port", type=int, default=8095)
+    ap.add_argument("--port", type=int, default=None,
+                    help="the port to listen on; default: \"port\" in the config, then $STRATA_PORT / default_port in settings.json, then 8080")
     ap.add_argument("--ready-file", help="write a JSON instance record once the API is bound and model state is known")
     ap.add_argument("--owner-fd", type=int, help=argparse.SUPPRESS)
     ap.add_argument("--shutdown-timeout", type=float, default=None,

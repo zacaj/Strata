@@ -532,6 +532,8 @@ inline int hy4_serve_main(const ServeOpts& o) {
         int made = 0;
         const char* finish = "length";
         const double t1 = now_s();
+        // decode-only VRAM expert hit counters (adaptive vcache; both stay 0 without it -> serve shows no hit rate)
+        const uint64_t vc_h0 = r.vc_hits, vc_m0 = r.vc_misses;
         if (cancelled) {
             proto("DONE 0 %d %.1f 0.0 cancel", T0, prompt_ms);
             fwd = 0;
@@ -602,7 +604,10 @@ inline int hy4_serve_main(const ServeOpts& o) {
         if (!reuse || has_images) fwd = 0;
         r.vis = nullptr;
         const double decode_ms = (now_s() - t1) * 1000.0;
-        proto("DONE %d %d %.1f %.1f %s 0 0 %d", made, T0, prompt_ms, decode_ms, finish, start);
+        const uint64_t vc_h = r.vc_hits - vc_h0, vc_l = vc_h + (r.vc_misses - vc_m0);
+        // fields 9/10 = hits / lookups, as the Strata engine's DONE line (serve's _parse_done)
+        proto("DONE %d %d %.1f %.1f %s 0 0 %d %llu %llu", made, T0, prompt_ms, decode_ms, finish, start,
+              (unsigned long long)vc_h, (unsigned long long)vc_l);
     }
     if (cc.on && dirty && fwd >= cc.min_tokens) cc.park(r, tok, fwd);
     HCK(hipDeviceSynchronize());

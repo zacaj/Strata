@@ -879,6 +879,8 @@ class Assembler:
         """Top-level `timings` on the final event, as /v1/chat/completions has them (#107)."""
         if done.get("timings"):
             event["timings"] = done["timings"]
+        if done.get("experts"):
+            event["strata_experts"] = done["experts"]
         return event
 
     def failed(self, message: str, code: str = "server_error") -> dict:
@@ -897,6 +899,6 @@ def collect(events) -> dict:
     for e in events:
         if e is not None:
             last = e
-    if last.get("timings"):                          # as on a whole /v1/chat/completions reply (#107)
-        return {**last["response"], "timings": last["timings"]}
-    return last["response"]
+    # as on a whole /v1/chat/completions reply (#107): the top-level extras of the final event
+    extra = {k: last[k] for k in ("timings", "strata_experts") if last.get(k)}
+    return {**last["response"], **extra} if extra else last["response"]

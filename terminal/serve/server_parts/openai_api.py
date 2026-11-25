@@ -203,6 +203,8 @@ def openai_collect(chunks) -> dict:
             {"reasoning_content": lps["reasoning_content"]} if lps.get("reasoning_content") else {})}
     if last.get("timings"):
         out["timings"] = last["timings"]
+    if last.get("strata_experts"):
+        out["strata_experts"] = last["strata_experts"]
     if last.get("strata_rejected_tool_calls"):
         out["strata_rejected_tool_calls"] = last["strata_rejected_tool_calls"]
     if last.get("strata_unread_tool_markup"):

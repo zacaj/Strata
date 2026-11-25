@@ -4262,6 +4262,34 @@ class UsageAndStatus(unittest.TestCase):
         self.assertGreater(u["output_tokens"], 0)
         self.assertEqual(self.chat("/v1/messages")["strata_effective"]["max_tokens"], 20)
 
+    def test_anthropic_timings(self):
+        # /v1/messages carries llama.cpp's timings too: on the whole reply, and on the stream's message_delta
+        b = self.chat("/v1/messages")
+        t, u = b["timings"], b["usage"]
+        self.assertEqual(t["cache_n"], u["cache_read_input_tokens"])
+        self.assertEqual(t["predicted_n"], u["output_tokens"])
+        self.assertAlmostEqual(t["predicted_per_second"], 50.0, delta=0.1)            # 20 ms a token
+        events = self.chat("/v1/messages", stream=True)
+        delta = [e for e in events if e.get("type") == "message_delta"][-1]
+        self.assertEqual(delta["timings"]["cache_n"], ClockedEngine.REUSED)
+        self.assertEqual(delta["timings"]["predicted_n"], delta["usage"]["output_tokens"])
+        self.assertNotIn("timings", [e for e in events if e.get("type") == "message_start"][0]["message"])
+
+    def test_expert_cache_figures_on_every_api(self):
+        # strata_experts: the request's expert cache hit rate (ClockedEngine: 9 hits of 10 lookups), on the whole
+        # reply and on the stream's last chunk / message_delta / response.completed, as the log line has it
+        want = {"hit_rate": 0.9, "hits": 9, "lookups": 10}
+        self.assertEqual(self.chat("/v1/chat/completions")["strata_experts"], want)
+        self.assertEqual(self.chat("/v1/chat/completions", stream=True)[-1]["strata_experts"], want)
+        self.assertEqual(self.chat("/v1/messages")["strata_experts"], want)
+        delta = [e for e in self.chat("/v1/messages", stream=True) if e.get("type") == "message_delta"][-1]
+        self.assertEqual(delta["strata_experts"], want)
+        body = {"model": "x", "max_output_tokens": 20, "input": "hi"}
+        self.assertEqual(json.loads(self.request("/v1/responses", body)[1])["strata_experts"], want)
+        raw = self.request("/v1/responses", {**body, "stream": True})[1]
+        last = [json.loads(line[6:]) for line in raw.decode().splitlines() if line.startswith("data: {")][-1]
+        self.assertEqual(last["strata_experts"], want)
+
     def test_effective_reports_the_thinking_settings(self):
         for path in ("/v1/chat/completions", "/v1/messages"):
             e = self.chat(path)["strata_effective"]
@@ -4315,6 +4343,7 @@ class UsageAndStatus(unittest.TestCase):
             with urllib.request.urlopen(req, timeout=30) as r:
                 b = json.loads(r.read())
             self.assertNotIn("timings", b)
+            self.assertNotIn("strata_experts", b)                 # no expert cache figures from it either
             self.assertEqual(b["usage"]["prompt_tokens_details"]["cached_tokens"], 0)
             self.assertIsNone(svc.v1_status()["last_timings"])
         finally:
