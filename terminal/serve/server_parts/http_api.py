@@ -421,11 +421,16 @@ def read_config(path) -> dict:
 def parse_config_text(text: str, path) -> dict:
     """read_config on text already read (the owner-launched server hashes the bytes it parses, launch attestation)."""
     try:
-        return json.loads(text)
+        cfg = json.loads(text)
     except json.JSONDecodeError as e:
         raise SystemExit(f"[strata] {path} is not valid JSON: {e.msg} at line {e.lineno}, column {e.colno}. Check the commas "
                          'between the entries of "args" (each option and each value is its own quoted entry, e.g. '
                          '"--ple-io", "mmap",) and that no entry is followed by a comma at the end of a list.') from None
+    from strata_control import config_layers           # "extends": the base files merged under this one
+    try:
+        return config_layers.resolve(cfg, path)
+    except config_layers.ConfigLayerError as e:
+        raise SystemExit(f"[strata] {e}") from None
 
 
 def lift_reasoning_effort_arg(cfg: dict) -> None:

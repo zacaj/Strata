@@ -15,6 +15,7 @@ from pathlib import Path
 
 from strata_control import user_args
 from strata_control import atomic as _atomic_mod
+from strata_control import config_layers
 
 # (key, kind, help).  kind: "bool", "int>=0", "num>=0", ("enum", values), "names", or ("sampling", check) for a key
 # of the "sampling" block, ("arg", flag) for an engine option kept in "args".
@@ -178,13 +179,13 @@ def save(path: str | Path, cfg: dict) -> Path:
     bak = path.with_name(path.name + ".bak")
     shutil.copyfile(path, bak)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    tmp.write_text(config_layers.dumps(path, cfg), encoding="utf-8")
     _atomic_mod.replace(tmp, path)
     return bak
 
 
 def load(path: str | Path) -> dict:
-    cfg = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    cfg = config_layers.load(path)                      # "extends": the base files merged under this one
     if not isinstance(cfg, dict):
         raise ValueError(f"{Path(path).name} is not a JSON object")
     return cfg

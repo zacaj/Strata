@@ -8,6 +8,7 @@ bytes of one GGUF, the sizes of the files directly in one or two folders): it an
 """
 from __future__ import annotations
 
+from strata_control import config_layers
 import json
 import os
 import re
@@ -144,7 +145,7 @@ def config_reason(cfg: Any) -> str | None:
 
 def read_config(path: Any) -> dict | None:
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        data = config_layers.load(Path(path))
     except (OSError, ValueError, TypeError):
         return None
     return data if isinstance(data, dict) else None

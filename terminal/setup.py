@@ -75,6 +75,7 @@ tls.install()      # #3722: HTTPS checks the server against the operating system
 from strata_control import atomic
 from strata_control import draft_layer
 from strata_control import engine_component
+from strata_control import config_layers
 from strata_control import sysinfo
 from strata_control.discovery import in_trash
 from strata_control import user_args
@@ -3993,7 +3994,7 @@ def migrate_run_configs(folder) -> list:
     moved = []
     for path in sorted(model_config_files(Path(folder))):
         try:
-            old = json.loads(path.read_text(encoding="utf-8-sig"))
+            old = config_layers.load(path)
         except (OSError, ValueError):
             continue
         new = migrate_ram_budget(old) if isinstance(old, dict) else None
@@ -4002,7 +4003,7 @@ def migrate_run_configs(folder) -> list:
         try:
             shutil.copyfile(path, path.with_name(path.name + ".bak"))
             tmp = path.with_name(path.name + ".tmp")
-            tmp.write_text(json.dumps(new, indent=1), encoding="utf-8")
+            tmp.write_text(config_layers.dumps(path, new), encoding="utf-8")
             atomic.replace(tmp, path)
             moved.append(path.name)
         except OSError:
@@ -7259,7 +7260,7 @@ def repoint_config(cfg_file: Path, old: Path, new: Path) -> None:
     """A config whose model files moved from `old` to `new` points at them there (each path only if its file is
     now there and no longer at the old place)."""
     try:
-        cfg = json.loads(cfg_file.read_text(encoding="utf-8-sig"))
+        cfg = config_layers.load(cfg_file)
     except (OSError, ValueError):
         return
 
@@ -7418,9 +7419,10 @@ def data_folder_in_place() -> tuple:
 
 def write_config(path: Path, cfg: dict):
     """A run config, written whole or not at all (#459): to a temporary file first, then moved over the old one, so
-    a setup stopped half-way (a closed window, a full disk) never leaves an empty strata-*.json behind."""
+    a setup stopped half-way (a closed window, a full disk) never leaves an empty strata-*.json behind.  A config that
+    "extends" others keeps only what differs from them (strata_control/config_layers.py)."""
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    tmp.write_text(config_layers.dumps(path, cfg), encoding="utf-8")
     atomic.replace(tmp, path)
     _RUN_CONFIGS.append(Path(path))
 
@@ -7611,7 +7613,7 @@ def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, ex
     old = None
     if old_path is not None and old_path.is_file():
         try:
-            old = json.loads(old_path.read_text(encoding="utf-8-sig"))
+            old = config_layers.load(old_path)
         except (OSError, ValueError):
             pass
         if not isinstance(old, dict):
@@ -7683,7 +7685,7 @@ def own_path_config(cfg: dict) -> bool:
 
 def choices_from_config(cfg_path: Path) -> dict:
     """The setup answers a config was written with (family, size, context, KV, images, projection, network)."""
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    cfg = config_layers.load(cfg_path)
     tag = cfg_path.stem[len("strata-"):]
     special_fams = {**OWN_PATH_FAMILIES, **HY4_FAMILIES, **INKLING_FAMILIES}
     own = next((f for f, d in special_fams.items() if tag.startswith(d["tag"])), None)
@@ -7918,7 +7920,7 @@ def model_config(path: Path) -> bool:
     """#549: a model's run config (a JSON object with "exe" and "args"). Any other strata-*.json in the folder (a
     file of the user's own, a cut-off one) is skipped with a warning naming it instead of stopping setup."""
     try:
-        cfg = json.loads(path.read_text(encoding="utf-8-sig"))
+        cfg = config_layers.load(path)
         if isinstance(cfg, dict) and cfg.get("exe") and isinstance(cfg.get("args"), list):
             return True
         why = 'no "exe" or "args"'
@@ -8107,7 +8109,7 @@ def calibrate_config(cfg_path: Path) -> bool:
     config and remember them per PC and model in the settings file, so an update or a reinstall keeps them."""
     sys.path.insert(0, str(ROOT / "tools"))
     import calibrate as CAL
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    cfg = config_layers.load(cfg_path)
     say()
     say("  Tuning Strata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
     say("  draft depth, the CPU threads, the expert cache; on two or more cards also the prompt chunks). It takes")
@@ -8398,13 +8400,13 @@ def update_install(have: list, a) -> int:
     update_installed_engine(a.prebuilt, rebuild=bool(a.build))      # --update --build compiles it (#5214); it used to skip the engine step
     mtp_done: set = set()
     for cfg_path in have:
-        cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+        cfg = upgrade_config(cfg_path, config_layers.load(cfg_path))
         if not own_path_config(cfg):
             refresh_shared_draft_vocab(cfg, mtp_done)
         if cfg.get("backend") == "hip" and WIN:
             hip_runtime_beside_exe(Path(cfg["exe"]).parent)   # #468 #461
         ok(f"{cfg.get('model_name', cfg_path.stem)}: up to date")
-    ver = config_engine_version(json.loads(have[0].read_text(encoding="utf-8-sig")))
+    ver = config_engine_version(config_layers.load(have[0]))
     say()
     start = "START-HERE.bat" if WIN else "./setup.sh"
     if any(ver) and tuple(ver) < MIN_ENGINE:             # #3653: the engine step failed above; "updated" would be untrue
@@ -8455,7 +8457,7 @@ def _start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open
            layer_split=None, keep=None) -> int:
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
     --vram-reserve-mib)."""
-    cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+    cfg = upgrade_config(cfg_path, config_layers.load(cfg_path))
     component = engine_component.is_reference(cfg["exe"])
     # The server resolves and verifies component engines; the reference itself is not a file.
     files = ([] if component else [cfg["exe"]]) + [a for a in cfg["args"] if a.endswith(".gguf")]
@@ -8604,7 +8606,7 @@ def saved_draft_vocab(cfg_path: Path) -> str | None:
     """The draft subset a model's config chose earlier (--draft-vocab), or None: a setup run again without the flag
     rewrites the config, and would otherwise put the default subset back."""
     try:
-        v = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("draft_vocab")
+        v = config_layers.load(cfg_path).get("draft_vocab")
     except (OSError, ValueError, AttributeError):
         return None
     return v if v in DRAFT_VOCABS else None

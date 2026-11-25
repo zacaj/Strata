@@ -1244,7 +1244,8 @@ def is_reference(value: object) -> bool:
 #: A source checkout runs its own build: the newest engine program under <checkout>/build*/ wins over every installed
 #: package, with no signature or pin (STRATA_NO_LOCAL_BUILD=1 turns this off).
 CHECKOUT = Path(__file__).resolve().parents[2]
-_BUILD_GLOBS = ("build*/{exe}", "build*/bin/{exe}", "build*/src/*/{exe}")
+# terminal/engine is where setup.py puts the engine it compiles (Linux): the newest of these wins, so a stale build*/ never shadows it
+_BUILD_GLOBS = ("build*/{exe}", "build*/bin/{exe}", "build*/src/*/{exe}", "terminal/engine/{exe}")
 
 
 def local_build_exe(name: str) -> Path | None:

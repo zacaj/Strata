@@ -136,7 +136,8 @@ def repair(configs) -> tuple[list[str], list[str]]:
             continue
         seen.add(c)
         try:
-            cfg = json.loads(c.read_text(encoding="utf-8-sig"))
+            from strata_control import config_layers
+            cfg = config_layers.load(c)
         except (OSError, ValueError):
             continue
         if not isinstance(cfg, dict):

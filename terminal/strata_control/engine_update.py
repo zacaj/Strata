@@ -21,6 +21,7 @@ adding it to a screen is one line, and waits for the owner's yes (the Terminal l
 
 from __future__ import annotations
 
+from strata_control import config_layers
 import datetime as dt
 import json
 import threading
@@ -194,7 +195,7 @@ def running_models(serving: list[dict] | None = None) -> list[RunningModel]:
         try:
             prof, _rev = profiles.load(pid)
             port = int((prof.get("overrides") or {}).get("port") or 0) or None
-            cfg = json.loads(Path(prof["source_config"]).read_text(encoding="utf-8-sig")) if prof.get("source_config") else {}
+            cfg = config_layers.load(Path(prof["source_config"])) if prof.get("source_config") else {}
             name = str(cfg.get("model_name") or name)
         except Exception:                                # noqa: BLE001 - the name is a nicety
             pass
@@ -221,7 +222,7 @@ def _start_wait(model: RunningModel) -> float:
     try:
         from strata_control import profiles
         prof, _rev = profiles.load(model.profile)
-        cfg = json.loads(Path(prof["source_config"]).read_text(encoding="utf-8-sig"))
+        cfg = config_layers.load(Path(prof["source_config"]))
         return min(1800.0, float(cfg.get("engine_ready_s") or 900) + 60)          # (runtime.start takes 0..1800; a DeepSeek config asks for more)
     except Exception:                                    # noqa: BLE001
         return 960.0

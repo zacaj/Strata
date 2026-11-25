@@ -23,6 +23,7 @@ a configuration that answers faster and wrongly is not an improvement.
 
 from __future__ import annotations
 
+from strata_control import config_layers
 import json
 import re
 import subprocess
@@ -270,7 +271,7 @@ def make_api_measure(*, python: Path | str, serve_dir: Path, config_path: Path, 
 
     from strata_control.tune_apply import apply_args_to_config, args_to_argv
 
-    base = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    base = config_layers.load(Path(config_path))
 
     def measure(candidate) -> dict[str, float]:
         args = getattr(candidate, "args", candidate)

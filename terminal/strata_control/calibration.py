@@ -97,7 +97,7 @@ def preview(ref: str) -> dict:
     path, profile, revision, cfg = _target(ref)
     components = inspect_components(path, profile_id=profile["id"] if profile else None)
     source_bytes = path.read_bytes()
-    if json.loads(source_bytes.decode("utf-8-sig")) != cfg:
+    if profiles.read_run_config(path) != cfg:                # resolved the same way (cfg_paths, "extends") as _target read it
         raise ProfileError("run config changed during calibration preview; retry", 6)
     return {"profile": profile["id"] if profile else None, "profile_revision": revision,
             "source_config": str(path), "source_sha256": hashlib.sha256(source_bytes).hexdigest(),

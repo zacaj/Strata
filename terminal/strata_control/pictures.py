@@ -440,7 +440,8 @@ def fetch(config_path: str | Path, *, engine_dir: str | Path, asked: str = "yes"
     report = progress or (lambda *_: None)
     config = Path(config_path)
     try:
-        cfg = json.loads(config.read_text(encoding="utf-8-sig"))
+        from strata_control import config_layers
+        cfg = config_layers.load(config)
         if not isinstance(cfg, dict):
             raise ValueError("not an object")
     except (OSError, ValueError):

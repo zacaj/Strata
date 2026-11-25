@@ -134,7 +134,8 @@ def validate_profile(value: object, *, expected_name: str | None = None) -> dict
 
 def read_run_config(path: Path) -> dict:
     try:
-        cfg = json.loads(path.read_text(encoding="utf-8-sig"))
+        from strata_control import config_layers
+        cfg = config_layers.load(path)
     except (OSError, ValueError) as exc:
         raise ProfileError(f"cannot read run config ({type(exc).__name__})", 5) from None
     if isinstance(cfg, dict):                                # paths into a version folder of Strata's own that an update removed: the current one

@@ -22,6 +22,7 @@ import re
 import shutil
 import tempfile
 import time
+from strata_control import config_layers
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -329,7 +330,7 @@ def repoint_config(cfg_file: Path, old: Path, new: Path) -> bool:
     """A run config whose model files moved from ``old`` to ``new`` names them there (each path only when its file is now there and no longer
     at the old place). Same rule as setup.py repoint_config. Returns whether the file changed."""
     try:
-        cfg = json.loads(cfg_file.read_text(encoding="utf-8-sig"))
+        cfg = config_layers.load(cfg_file)
     except (OSError, ValueError):
         return False
 
@@ -353,7 +354,7 @@ def repoint_config(cfg_file: Path, old: Path, new: Path) -> bool:
     if fixed == cfg:
         return False
     tmp = cfg_file.with_name(cfg_file.name + ".move-tmp")
-    tmp.write_text(json.dumps(fixed, indent=2) + "\n", encoding="utf-8")
+    tmp.write_text(config_layers.dumps(cfg_file, fixed, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, cfg_file)
     return True
 

@@ -14,6 +14,7 @@ child is still there.
 """
 
 from __future__ import annotations
+from strata_control import config_layers
 import sys
 if sys.platform == "win32":
     # CPython 3.12's WMI helper (_wmi, behind platform.system() / uname()) takes an access violation in a worker thread when WMI refuses the
@@ -513,7 +514,7 @@ def _engine_preflight(plan: dict) -> None:
     PC is missing or fails its integrity check (every file's SHA-256). The server checks again when it starts the engine; this
     check makes the refusal the first thing the user sees, with the file named, instead of a log line behind 'server_exited'."""
     try:
-        cfg = json.loads(Path(plan["source_config"]).read_text(encoding="utf-8-sig"))
+        cfg = config_layers.load(Path(plan["source_config"]))
     except (OSError, ValueError, KeyError, TypeError):
         return
     if not isinstance(cfg, dict):

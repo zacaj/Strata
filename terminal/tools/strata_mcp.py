@@ -831,7 +831,8 @@ class Strata:
     @staticmethod
     def read_config(path: Path) -> dict:
         try:
-            cfg = json.loads(path.read_text(encoding="utf-8-sig"))
+            from strata_control import config_layers
+            cfg = config_layers.load(path)
             return cfg if isinstance(cfg, dict) else {}
         except (OSError, ValueError):
             return {}
